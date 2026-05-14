@@ -81,7 +81,8 @@ class GtfsExporter:
                     "stop_lat": sp["lat"],
                     "stop_lon": sp["lon"],
                     "location_type": 0,
-                    "parent_station": sp.get("stop_area_id", "")
+                    "parent_station": sp.get("stop_area_id", ""),
+                    "wheelchair_boarding": sp.get("wheelchair_boarding", "") if sp.get("wheelchair_boarding") is not None else "",
                 })
             write_csv("stops.txt", stops)
 
@@ -118,11 +119,16 @@ class GtfsExporter:
             service_journeys = db.get_records("service_journey")
             trips = []
             for sj in service_journeys:
-                trips.append({
+                trip = {
                     "route_id": sj["line_id"],
                     "service_id": sj["day_type_id"],
-                    "trip_id": sj["id"]
-                })
+                    "trip_id": sj["id"],
+                    "wheelchair_accessible": sj.get("wheelchair_accessible", "") if sj.get("wheelchair_accessible") is not None else "",
+                    "bikes_allowed": sj.get("bikes_allowed", "") if sj.get("bikes_allowed") is not None else "",
+                }
+                if sj.get("shape_id"):
+                    trip["shape_id"] = sj["shape_id"]
+                trips.append(trip)
             write_csv("trips.txt", trips)
 
             # 7. stop_times.txt
@@ -137,3 +143,62 @@ class GtfsExporter:
                     "stop_sequence": pt["order"]
                 })
             write_csv("stop_times.txt", stop_times)
+
+            # 8. feed_info.txt
+            feed_infos = db.get_records("feed_info")
+            fi_rows = []
+            for fi in feed_infos:
+                fi_rows.append({
+                    "feed_publisher_name": fi["publisher_name"],
+                    "feed_publisher_url": fi["publisher_url"],
+                    "feed_lang": fi["lang"],
+                    "feed_start_date": fi.get("start_date", ""),
+                    "feed_end_date": fi.get("end_date", ""),
+                    "feed_version": fi.get("version", ""),
+                    "feed_contact_email": fi.get("contact_email", ""),
+                    "feed_contact_url": fi.get("contact_url", ""),
+                })
+            write_csv("feed_info.txt", fi_rows)
+
+            # 9. shapes.txt
+            if self.include_shapes:
+                shape_points = db.get_records("shape_point")
+                shapes = []
+                for sp in shape_points:
+                    row = {
+                        "shape_id": sp["shape_id"],
+                        "shape_pt_lat": sp["lat"],
+                        "shape_pt_lon": sp["lon"],
+                        "shape_pt_sequence": sp["sequence"],
+                    }
+                    if sp.get("dist_traveled") is not None:
+                        row["shape_dist_traveled"] = sp["dist_traveled"]
+                    shapes.append(row)
+                write_csv("shapes.txt", shapes)
+
+            # 10. frequencies.txt
+            freq_records = db.get_records("frequency")
+            freqs = []
+            for fr in freq_records:
+                freqs.append({
+                    "trip_id": fr["service_journey_id"],
+                    "start_time": fr["start_time"],
+                    "end_time": fr["end_time"],
+                    "headway_secs": fr["headway_secs"],
+                    "exact_times": fr.get("exact_times", 0),
+                })
+            write_csv("frequencies.txt", freqs)
+
+            # 11. transfers.txt
+            transfer_records = db.get_records("transfer")
+            transfers = []
+            for tr in transfer_records:
+                row = {
+                    "from_stop_id": tr["from_stop_id"],
+                    "to_stop_id": tr["to_stop_id"],
+                    "transfer_type": tr["transfer_type"],
+                }
+                if tr.get("min_transfer_time") is not None:
+                    row["min_transfer_time"] = tr["min_transfer_time"]
+                transfers.append(row)
+            write_csv("transfers.txt", transfers)

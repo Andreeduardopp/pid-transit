@@ -16,7 +16,11 @@ from .repositories import (
     JourneyPatternRepository,
     PointInJourneyPatternRepository,
     ServiceJourneyRepository,
-    PassingTimeRepository
+    PassingTimeRepository,
+    FeedInfoRepository,
+    ShapePointRepository,
+    FrequencyRepository,
+    TransferRepository,
 )
 from .exceptions import ImportFailedError
 
@@ -44,6 +48,10 @@ class TransitDataset:
         self.points_in_journey_pattern = PointInJourneyPatternRepository(self.db)
         self.service_journeys = ServiceJourneyRepository(self.db)
         self.passing_times = PassingTimeRepository(self.db)
+        self.feed_info = FeedInfoRepository(self.db)
+        self.shape_points = ShapePointRepository(self.db)
+        self.frequencies = FrequencyRepository(self.db)
+        self.transfers = TransferRepository(self.db)
 
     def import_data(self, importer, source: Union[str, Path]) -> Dict[str, int]:
         """

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(java *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\eduar\\\\Documents\\\\gtfs-tool\\\\PID-GTFS\" -Recurse -Filter \"*.zip\")",
+      "Bash(Select-Object -Property FullName, Name)"
+    ]
+  }
+}

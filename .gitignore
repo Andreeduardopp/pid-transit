@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+*.zip
+validator/
 
 # Distribution / packaging
 .Python
@@ -160,3 +162,7 @@ cython_debug/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Validator — downloaded tools and runtime output (large / generated files)
+validator/tools/
+validator/output/

@@ -37,11 +37,12 @@ _TABLE_SCHEMAS = {
     """,
     "scheduled_stop_point": """
         CREATE TABLE IF NOT EXISTS scheduled_stop_point (
-            id           TEXT PRIMARY KEY,
-            name         TEXT NOT NULL,
-            lat          REAL NOT NULL,
-            lon          REAL NOT NULL,
-            stop_area_id TEXT
+            id                  TEXT PRIMARY KEY,
+            name                TEXT NOT NULL,
+            lat                 REAL NOT NULL,
+            lon                 REAL NOT NULL,
+            stop_area_id        TEXT,
+            wheelchair_boarding INTEGER
         )
     """,
     "day_type": """
@@ -83,11 +84,14 @@ _TABLE_SCHEMAS = {
     """,
     "service_journey": """
         CREATE TABLE IF NOT EXISTS service_journey (
-            id                 TEXT PRIMARY KEY,
-            line_id            TEXT NOT NULL REFERENCES line(id),
-            journey_pattern_id TEXT REFERENCES journey_pattern(id),
-            day_type_id        TEXT NOT NULL REFERENCES day_type(id),
-            departure_time     TEXT NOT NULL
+            id                    TEXT PRIMARY KEY,
+            line_id               TEXT NOT NULL REFERENCES line(id),
+            journey_pattern_id    TEXT REFERENCES journey_pattern(id),
+            day_type_id           TEXT NOT NULL REFERENCES day_type(id),
+            departure_time        TEXT NOT NULL,
+            wheelchair_accessible INTEGER,
+            bikes_allowed         INTEGER,
+            shape_id              TEXT
         )
     """,
     "passing_time": """
@@ -98,6 +102,48 @@ _TABLE_SCHEMAS = {
             arrival_time       TEXT,
             departure_time     TEXT,
             PRIMARY KEY (service_journey_id, "order")
+        )
+    """,
+    "feed_info": """
+        CREATE TABLE IF NOT EXISTS feed_info (
+            id              TEXT PRIMARY KEY,
+            publisher_name  TEXT NOT NULL,
+            publisher_url   TEXT NOT NULL,
+            lang            TEXT NOT NULL,
+            start_date      TEXT,
+            end_date        TEXT,
+            version         TEXT,
+            contact_email   TEXT,
+            contact_url     TEXT
+        )
+    """,
+    "shape_point": """
+        CREATE TABLE IF NOT EXISTS shape_point (
+            shape_id      TEXT NOT NULL,
+            lat           REAL NOT NULL,
+            lon           REAL NOT NULL,
+            sequence      INTEGER NOT NULL,
+            dist_traveled REAL,
+            PRIMARY KEY (shape_id, sequence)
+        )
+    """,
+    "frequency": """
+        CREATE TABLE IF NOT EXISTS frequency (
+            service_journey_id TEXT NOT NULL REFERENCES service_journey(id),
+            start_time         TEXT NOT NULL,
+            end_time           TEXT NOT NULL,
+            headway_secs       INTEGER NOT NULL,
+            exact_times        INTEGER DEFAULT 0,
+            PRIMARY KEY (service_journey_id, start_time)
+        )
+    """,
+    "transfer": """
+        CREATE TABLE IF NOT EXISTS transfer (
+            from_stop_id      TEXT NOT NULL REFERENCES scheduled_stop_point(id),
+            to_stop_id        TEXT NOT NULL REFERENCES scheduled_stop_point(id),
+            transfer_type     INTEGER NOT NULL DEFAULT 0,
+            min_transfer_time INTEGER,
+            PRIMARY KEY (from_stop_id, to_stop_id)
         )
     """,
     "_meta": """
@@ -193,6 +239,84 @@ class TransmodelDatabase:
         try:
             cur = conn.execute(f"SELECT * FROM {table_name}")
             return [dict(row) for row in cur.fetchall()]
+        finally:
+            if not self._in_memory:
+                conn.close()
+
+    def query(
+        self,
+        table_name: str,
+        where: Optional[Dict[str, Any]] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch records with optional filtering, ordering, and limit."""
+        sql = f"SELECT * FROM {table_name}"
+        params: list = []
+        if where:
+            clauses = []
+            for col, val in where.items():
+                safe_col = f'"{col}"' if col == "order" else col
+                clauses.append(f"{safe_col} = ?")
+                params.append(val)
+            sql += " WHERE " + " AND ".join(clauses)
+        if order_by:
+            safe_order = f'"{order_by}"' if order_by == "order" else order_by
+            sql += f" ORDER BY {safe_order}"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        conn = self.connect()
+        try:
+            cur = conn.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            if not self._in_memory:
+                conn.close()
+
+    def get_one(
+        self, table_name: str, where: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a single record matching the where clause, or None."""
+        results = self.query(table_name, where=where, limit=1)
+        return results[0] if results else None
+
+    def count(
+        self, table_name: str, where: Optional[Dict[str, Any]] = None
+    ) -> int:
+        """Count records, optionally filtered."""
+        sql = f"SELECT COUNT(*) FROM {table_name}"
+        params: list = []
+        if where:
+            clauses = []
+            for col, val in where.items():
+                safe_col = f'"{col}"' if col == "order" else col
+                clauses.append(f"{safe_col} = ?")
+                params.append(val)
+            sql += " WHERE " + " AND ".join(clauses)
+        conn = self.connect()
+        try:
+            cur = conn.execute(sql, params)
+            return cur.fetchone()[0]
+        finally:
+            if not self._in_memory:
+                conn.close()
+
+    def delete(self, table_name: str, where: Dict[str, Any]) -> int:
+        """Delete records matching the where clause. Returns count deleted."""
+        if not where:
+            raise ValueError("where clause required for delete")
+        clauses = []
+        params: list = []
+        for col, val in where.items():
+            safe_col = f'"{col}"' if col == "order" else col
+            clauses.append(f"{safe_col} = ?")
+            params.append(val)
+        sql = f"DELETE FROM {table_name} WHERE " + " AND ".join(clauses)
+        conn = self.connect()
+        try:
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur.rowcount
         finally:
             if not self._in_memory:
                 conn.close()

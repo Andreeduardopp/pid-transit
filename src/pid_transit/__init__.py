@@ -20,11 +20,19 @@ from .core.schemas import (
     PointInJourneyPattern,
     ServiceJourney,
     PassingTime,
+    FeedInfo,
+    ShapePoint,
+    Frequency,
+    Transfer,
     TransportMode,
-    DirectionType
+    DirectionType,
 )
+from .analytics.statistics import TransitStatistics
+from .analytics.diff import FeedDiffer, FeedDiffReport
+from .analytics.merge import FeedMerger
+from .analytics.rt_readiness import check_rt_readiness, RTReadinessReport
 
-__version__ = "0.2.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "TransitDataset",
@@ -33,7 +41,13 @@ __all__ = [
     "NetexImporter",
     "NetexExporter",
     "SpreadsheetImporter",
-    
+    "TransitStatistics",
+    "FeedDiffer",
+    "FeedDiffReport",
+    "FeedMerger",
+    "check_rt_readiness",
+    "RTReadinessReport",
+
     # Models
     "Operator",
     "Line",
@@ -44,6 +58,10 @@ __all__ = [
     "PointInJourneyPattern",
     "ServiceJourney",
     "PassingTime",
+    "FeedInfo",
+    "ShapePoint",
+    "Frequency",
+    "Transfer",
     "TransportMode",
-    "DirectionType"
+    "DirectionType",
 ]

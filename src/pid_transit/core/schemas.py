@@ -53,6 +53,7 @@ class ScheduledStopPoint(BaseModel):
     lat: float = Field(..., ge=-90, le=90, description="Latitude")
     lon: float = Field(..., ge=-180, le=180, description="Longitude")
     stop_area_id: Optional[str] = Field(None, description="Reference to a parent StopPlace/StopArea")
+    wheelchair_boarding: Optional[int] = Field(None, description="0=no info, 1=yes, 2=no")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Timetable and Scheduling
@@ -96,6 +97,9 @@ class ServiceJourney(BaseModel):
     journey_pattern_id: Optional[str] = Field(None, description="Reference to JourneyPattern.id")
     day_type_id: str = Field(..., description="Reference to DayType.id")
     departure_time: str = Field(..., description="HH:MM:SS format")
+    wheelchair_accessible: Optional[int] = Field(None, description="0=no info, 1=yes, 2=no")
+    bikes_allowed: Optional[int] = Field(None, description="0=no info, 1=yes, 2=no")
+    shape_id: Optional[str] = Field(None, description="Reference to shape geometry")
 
 class PassingTime(BaseModel):
     """Corresponds to Transmodel 'PassingTime' / GTFS 'stop_times'."""
@@ -104,6 +108,45 @@ class PassingTime(BaseModel):
     order: int = Field(..., description="Sequence order matching PointInJourneyPattern")
     arrival_time: Optional[str] = Field(None, description="HH:MM:SS format")
     departure_time: Optional[str] = Field(None, description="HH:MM:SS format")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Supplementary Entities
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FeedInfo(BaseModel):
+    """Feed-level metadata / GTFS 'feed_info'."""
+    id: str = Field(default="default_feed", description="Feed identifier")
+    publisher_name: str = Field(..., description="Organization publishing the feed")
+    publisher_url: str = Field(..., description="Publisher's URL")
+    lang: str = Field(..., description="Default language (e.g., pt)")
+    start_date: Optional[str] = Field(None, description="Feed validity start YYYYMMDD")
+    end_date: Optional[str] = Field(None, description="Feed validity end YYYYMMDD")
+    version: Optional[str] = Field(None, description="Feed version string")
+    contact_email: Optional[str] = Field(None)
+    contact_url: Optional[str] = Field(None)
+
+class ShapePoint(BaseModel):
+    """A single point in a route shape / GTFS 'shapes'."""
+    shape_id: str = Field(..., description="Shape group identifier")
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
+    sequence: int = Field(..., description="Order along the shape")
+    dist_traveled: Optional[float] = Field(None, description="Cumulative distance in meters")
+
+class Frequency(BaseModel):
+    """Headway-based service / GTFS 'frequencies'."""
+    service_journey_id: str = Field(..., description="Reference to ServiceJourney.id")
+    start_time: str = Field(..., description="HH:MM:SS")
+    end_time: str = Field(..., description="HH:MM:SS")
+    headway_secs: int = Field(..., description="Seconds between departures")
+    exact_times: Optional[int] = Field(0, description="0=frequency, 1=exact schedule")
+
+class Transfer(BaseModel):
+    """Stop-to-stop transfer rule / GTFS 'transfers'."""
+    from_stop_id: str = Field(..., description="Reference to ScheduledStopPoint.id")
+    to_stop_id: str = Field(..., description="Reference to ScheduledStopPoint.id")
+    transfer_type: int = Field(0, description="0=recommended, 1=timed, 2=min_time, 3=none")
+    min_transfer_time: Optional[int] = Field(None, description="Minimum transfer time in seconds")
 
 # Registry of all core models for database iteration
 TRANSMODEL_ENTITIES = {
@@ -116,4 +159,8 @@ TRANSMODEL_ENTITIES = {
     "point_in_journey_pattern": PointInJourneyPattern,
     "service_journey": ServiceJourney,
     "passing_time": PassingTime,
+    "feed_info": FeedInfo,
+    "shape_point": ShapePoint,
+    "frequency": Frequency,
+    "transfer": Transfer,
 }

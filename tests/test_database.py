@@ -1,162 +1,129 @@
-"""Tests for pid_transit.legacy.database.GtfsDatabase."""
-
-from pathlib import Path
+"""Tests for pid_transit.core.database.TransmodelDatabase."""
 
 import pytest
 
-from pid_transit.legacy import GtfsDatabase
+from pid_transit.core.database import TransmodelDatabase
 
 
 class TestConstruction:
+    def test_in_memory(self):
+        db = TransmodelDatabase(":memory:")
+        assert db.count("operator") == 0
+
     def test_creates_file(self, tmp_path):
-        path = tmp_path / "a.db"
-        db = GtfsDatabase(path)
-        assert db.exists()
+        path = tmp_path / "test.db"
+        TransmodelDatabase(path)
         assert path.exists()
 
+    def test_creates_parent_dirs(self, tmp_path):
+        nested = tmp_path / "a" / "b" / "test.db"
+        TransmodelDatabase(nested)
+        assert nested.exists()
+
     def test_idempotent(self, tmp_path):
-        path = tmp_path / "a.db"
-        GtfsDatabase(path)
-        # Second construction should not wipe existing data
-        db = GtfsDatabase(path)
-        db.upsert("agency", [{
-            "agency_id": "A1", "agency_name": "X",
-            "agency_url": "https://x.com", "agency_timezone": "UTC",
+        path = tmp_path / "test.db"
+        db1 = TransmodelDatabase(path)
+        db1.upsert("operator", [{
+            "id": "OP1", "name": "X", "timezone": "UTC",
         }])
-        db2 = GtfsDatabase(path)
-        assert db2.count("agency") == 1
-
-    def test_creates_parent_dir(self, tmp_path):
-        nested = tmp_path / "deep" / "deeper" / "x.db"
-        db = GtfsDatabase(nested)
-        assert db.exists()
-
-    def test_from_slug_uses_root(self, tmp_path):
-        db = GtfsDatabase.from_slug("myfeed", root=tmp_path)
-        assert db.db_path == tmp_path / "myfeed.db"
-        assert db.exists()
-
-    def test_from_slug_default_root_is_cwd(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        db = GtfsDatabase.from_slug("myfeed")
-        try:
-            assert db.db_path.resolve() == (tmp_path / "myfeed.db").resolve()
-        finally:
-            db.db_path.unlink(missing_ok=True)
+        db2 = TransmodelDatabase(path)
+        assert db2.count("operator") == 1
 
 
 class TestUpsert:
-    def test_valid_insert(self, db):
-        result = db.upsert("agency", [{
-            "agency_id": "A1", "agency_name": "X",
-            "agency_url": "https://x.com", "agency_timezone": "UTC",
-        }])
-        assert result.inserted == 1
-        assert result.failed == 0
-        assert db.count("agency") == 1
+    def test_insert(self, db, sample_operator):
+        n = db.upsert("operator", [sample_operator])
+        assert n == 1
+        assert db.count("operator") == 1
 
-    def test_replaces_existing(self, db):
-        row = {
-            "agency_id": "A1", "agency_name": "X",
-            "agency_url": "https://x.com", "agency_timezone": "UTC",
-        }
-        db.upsert("agency", [row])
-        db.upsert("agency", [{**row, "agency_name": "Y"}])
-        rows = db.get_records("agency")
+    def test_replace_existing(self, db, sample_operator):
+        db.upsert("operator", [sample_operator])
+        db.upsert("operator", [{**sample_operator, "name": "Updated"}])
+        rows = db.get_records("operator")
         assert len(rows) == 1
-        assert rows[0]["agency_name"] == "Y"
+        assert rows[0]["name"] == "Updated"
 
-    def test_invalid_record_fails_but_valid_commits(self, db):
-        result = db.upsert("agency", [
-            {"agency_id": "A1", "agency_name": "X",
-             "agency_url": "https://x.com", "agency_timezone": "UTC"},
-            {"agency_id": "A2"},  # missing required fields
-        ])
-        assert result.inserted == 1
-        assert result.failed == 1
-        assert len(result.errors) == 1
+    def test_unknown_table_raises(self, db):
+        with pytest.raises(ValueError, match="Unknown table"):
+            db.upsert("not_a_table", [{}])
 
-    def test_unknown_table(self, db):
-        result = db.upsert("not_a_table", [{}])
-        assert result.inserted == 0
-        assert result.failed == 1
+    def test_validates_via_pydantic(self, db):
+        with pytest.raises(Exception):
+            db.upsert("operator", [{"id": "X"}])
+
+    def test_multiple_records(self, db, sample_stops):
+        n = db.upsert("scheduled_stop_point", sample_stops)
+        assert n == 2
+        assert db.count("scheduled_stop_point") == 2
 
 
-class TestRead:
-    def test_get_records_pagination(self, db):
-        db.upsert("stops", [
-            {"stop_id": f"S{i}", "stop_name": f"n{i}",
-             "stop_lat": 40.0, "stop_lon": -74.0}
-            for i in range(10)
-        ])
-        page = db.get_records("stops", limit=3, offset=5)
-        assert len(page) == 3
+class TestGetRecords:
+    def test_empty_table(self, db):
+        assert db.get_records("operator") == []
 
-    def test_count(self, db):
-        db.upsert("stops", [
-            {"stop_id": f"S{i}", "stop_name": "x",
-             "stop_lat": 40.0, "stop_lon": -74.0}
-            for i in range(4)
-        ])
-        assert db.count("stops") == 4
+    def test_returns_dicts(self, db, sample_operator):
+        db.upsert("operator", [sample_operator])
+        records = db.get_records("operator")
+        assert len(records) == 1
+        assert isinstance(records[0], dict)
+        assert records[0]["id"] == "OP1"
+
+
+class TestQuery:
+    def test_where_filter(self, populated_db):
+        results = populated_db.query("scheduled_stop_point", where={"id": "S1"})
+        assert len(results) == 1
+        assert results[0]["name"] == "Stop One"
+
+    def test_order_by(self, populated_db):
+        results = populated_db.query(
+            "point_in_journey_pattern",
+            where={"journey_pattern_id": "JP_T1"},
+            order_by="order",
+        )
+        assert len(results) == 2
+        assert results[0]["order"] <= results[1]["order"]
+
+    def test_limit(self, populated_db):
+        results = populated_db.query("scheduled_stop_point", limit=1)
+        assert len(results) == 1
+
+    def test_no_matches(self, populated_db):
+        results = populated_db.query("operator", where={"id": "NOPE"})
+        assert results == []
+
+
+class TestGetOne:
+    def test_found(self, populated_db):
+        record = populated_db.get_one("operator", where={"id": "OP1"})
+        assert record is not None
+        assert record["name"] == "Test Agency"
+
+    def test_not_found(self, populated_db):
+        record = populated_db.get_one("operator", where={"id": "NOPE"})
+        assert record is None
+
+
+class TestCount:
+    def test_total(self, populated_db):
+        assert populated_db.count("scheduled_stop_point") == 2
+
+    def test_filtered(self, populated_db):
+        assert populated_db.count("scheduled_stop_point", where={"id": "S1"}) == 1
+        assert populated_db.count("scheduled_stop_point", where={"id": "NOPE"}) == 0
 
 
 class TestDelete:
-    def test_delete_by_single_pk(self, db):
-        db.upsert("agency", [{
-            "agency_id": "A1", "agency_name": "X",
-            "agency_url": "https://x.com", "agency_timezone": "UTC",
-        }])
-        n = db.delete("agency", ["A1"])
+    def test_delete_by_id(self, db, sample_operator):
+        db.upsert("operator", [sample_operator])
+        n = db.delete("operator", where={"id": "OP1"})
         assert n == 1
-        assert db.count("agency") == 0
+        assert db.count("operator") == 0
 
-    def test_clear_table(self, db):
-        db.upsert("stops", [
-            {"stop_id": "S1", "stop_name": "x",
-             "stop_lat": 40.0, "stop_lon": -74.0},
-        ])
-        n = db.clear("stops")
-        assert n == 1
+    def test_delete_no_match(self, populated_db):
+        n = populated_db.delete("operator", where={"id": "NOPE"})
+        assert n == 0
 
-    def test_clear_all_respects_fk_order(self, populated_db):
-        deleted = populated_db.clear_all()
-        assert populated_db.count("stop_times") == 0
-        assert populated_db.count("agency") == 0
-        # clear_all always reports every known table (even if the count is 0)
-        assert "stop_times" in deleted
-
-
-class TestIntegrity:
-    def test_clean_on_populated_db(self, populated_db):
-        report = populated_db.check_integrity()
-        assert report.is_clean
-        assert report.violations == []
-
-    def test_detects_orphan_when_fk_violated_via_raw_insert(self, db):
-        # Bypass the class to insert an orphan row via raw connection
-        conn = db.connect()
-        conn.execute("PRAGMA foreign_keys = OFF")
-        conn.execute(
-            "INSERT INTO routes (route_id, agency_id, route_type) "
-            "VALUES (?, ?, ?)",
-            ("R_orphan", "NOT_REAL", 3),
-        )
-        conn.commit()
-        conn.close()
-        report = db.check_integrity()
-        assert not report.is_clean
-        assert any(v.table == "routes" for v in report.violations)
-
-
-class TestSummary:
-    def test_empty(self, db):
-        s = db.summary()
-        assert s["exists"]
-        assert s["total_records"] == 0
-        assert "stops" in s["empty_tables"]
-
-    def test_populated(self, populated_db):
-        s = populated_db.summary()
-        assert s["total_records"] > 0
-        assert "agency" in s["populated_tables"]
+    def test_delete_requires_where(self, populated_db):
+        with pytest.raises(ValueError):
+            populated_db.delete("operator", where={})

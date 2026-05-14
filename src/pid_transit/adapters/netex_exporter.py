@@ -24,6 +24,15 @@ DAY_FLAG_TO_NAME = [
 ]
 
 
+def _normalize_time(gtfs_time: str) -> tuple[str, int]:
+    """Convert a GTFS time (may be >= 24:00:00) to (xs:time, day_offset)."""
+    parts = gtfs_time.strip().split(":")
+    h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+    day_offset = h // 24
+    h = h % 24
+    return f"{h:02d}:{m:02d}:{s:02d}", day_offset
+
+
 class NetexExporter:
     """
     Exports a TransmodelDatabase to a NeTEx XML file (PT-EPIP profile).
@@ -35,8 +44,10 @@ class NetexExporter:
       TimetableFrame — DayTypes, ServiceJourneys, TimetabledPassingTimes
     """
 
-    def __init__(self, profile: str = "EPIP"):
+    def __init__(self, profile: str = "EPIP", deduplicate_patterns: bool = True, compress: bool = False):
         self.profile = profile
+        self.deduplicate_patterns = deduplicate_patterns
+        self.compress = compress
         self._nsmap = {
             "xmlns": "http://www.netex.org.uk/netex",
             "xmlns:siri": "http://www.siri.org.uk/siri",
@@ -44,7 +55,43 @@ class NetexExporter:
             "version": "1.1",
         }
 
+    def _build_pattern_dedup_map(self, db: TransmodelDatabase) -> dict:
+        """Build a mapping from original JP ids to canonical JP ids.
+
+        Groups patterns by (line_id, direction, ordered stop sequence).
+        Returns {original_id: canonical_id} and the set of canonical IDs.
+        """
+        patterns = db.get_records("journey_pattern")
+        points = db.get_records("point_in_journey_pattern")
+
+        points_by_pattern: dict = {}
+        for pt in points:
+            points_by_pattern.setdefault(pt["journey_pattern_id"], []).append(pt)
+
+        sig_to_canonical: dict = {}
+        remap: dict = {}
+
+        for jp in patterns:
+            jp_id = jp["id"]
+            pts = points_by_pattern.get(jp_id, [])
+            pts.sort(key=lambda p: p["order"])
+            stop_sig = tuple(p["stop_point_id"] for p in pts)
+            sig = (jp.get("line_id"), jp.get("direction"), stop_sig)
+
+            if sig not in sig_to_canonical:
+                sig_to_canonical[sig] = jp_id
+            remap[jp_id] = sig_to_canonical[sig]
+
+        canonical_ids = set(sig_to_canonical.values())
+        return remap, canonical_ids
+
     def export_from_db(self, db: TransmodelDatabase, output_path: Union[Path, str]) -> None:
+        if self.deduplicate_patterns:
+            self._jp_remap, self._canonical_jps = self._build_pattern_dedup_map(db)
+        else:
+            self._jp_remap = None
+            self._canonical_jps = None
+
         root = ET.Element("PublicationDelivery", attrib=self._nsmap)
 
         ET.SubElement(root, "PublicationTimestamp").text = (
@@ -62,13 +109,20 @@ class NetexExporter:
         self._write_resource_frame(db, frames)
         self._write_site_frame(db, frames)
         self._write_service_frame(db, frames)
+        self._write_service_calendar_frame(db, frames)
         self._write_timetable_frame(db, frames)
 
         raw = ET.tostring(root, encoding="utf-8")
         pretty = minidom.parseString(raw).toprettyxml(indent="  ")
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(pretty)
+        out_path = Path(output_path)
+        if self.compress:
+            import gzip
+            with gzip.open(str(out_path) + ".gz", "wt", encoding="utf-8") as f:
+                f.write(pretty)
+        else:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(pretty)
 
     # -------------------------------------------------------------------------
     # ResourceFrame — operators
@@ -161,13 +215,13 @@ class NetexExporter:
             for pts in points_by_pattern.values():
                 pts.sort(key=lambda p: p["order"])
 
+            if self._canonical_jps is not None:
+                patterns = [jp for jp in patterns if jp["id"] in self._canonical_jps]
+
             patterns_el = ET.SubElement(frame, "journeyPatterns")
             for jp in patterns:
                 el = ET.SubElement(patterns_el, "JourneyPattern", attrib={
                     "id": jp["id"], "version": "1"
-                })
-                ET.SubElement(el, "LineRef", attrib={
-                    "ref": jp["line_id"], "version": "1"
                 })
                 if jp.get("direction"):
                     ET.SubElement(el, "DirectionType").text = jp["direction"]
@@ -187,33 +241,43 @@ class NetexExporter:
                         })
 
     # -------------------------------------------------------------------------
-    # TimetableFrame — day types, service journeys, passing times
+    # ServiceCalendarFrame — day types
+    # -------------------------------------------------------------------------
+
+    def _write_service_calendar_frame(self, db: TransmodelDatabase, frames: ET.Element) -> None:
+        day_types = db.get_records("day_type")
+        if not day_types:
+            return
+
+        frame = ET.SubElement(frames, "ServiceCalendarFrame", attrib={
+            "id": "PID:ServiceCalendarFrame:01", "version": "1"
+        })
+        dt_container = ET.SubElement(frame, "dayTypes")
+        for dt in day_types:
+            el = ET.SubElement(dt_container, "DayType", attrib={
+                "id": dt["id"], "version": "1"
+            })
+            active = " ".join(
+                name for flag, name in DAY_FLAG_TO_NAME if dt.get(flag)
+            )
+            if active:
+                pod = ET.SubElement(ET.SubElement(el, "properties"), "PropertyOfDay")
+                ET.SubElement(pod, "DaysOfWeek").text = active
+
+    # -------------------------------------------------------------------------
+    # TimetableFrame — service journeys, passing times
     # -------------------------------------------------------------------------
 
     def _write_timetable_frame(self, db: TransmodelDatabase, frames: ET.Element) -> None:
-        day_types = db.get_records("day_type")
         journeys = db.get_records("service_journey")
         passing_times = db.get_records("passing_time")
 
-        if not day_types and not journeys:
+        if not journeys:
             return
 
         frame = ET.SubElement(frames, "TimetableFrame", attrib={
             "id": "PID:TimetableFrame:01", "version": "1"
         })
-
-        if day_types:
-            dt_container = ET.SubElement(frame, "dayTypes")
-            for dt in day_types:
-                el = ET.SubElement(dt_container, "DayType", attrib={
-                    "id": dt["id"], "version": "1"
-                })
-                active = " ".join(
-                    name for flag, name in DAY_FLAG_TO_NAME if dt.get(flag)
-                )
-                if active:
-                    pod = ET.SubElement(ET.SubElement(el, "properties"), "PropertyOfDay")
-                    ET.SubElement(pod, "DaysOfWeek").text = active
 
         pt_by_journey: dict = {}
         for pt in passing_times:
@@ -227,17 +291,24 @@ class NetexExporter:
                 el = ET.SubElement(journeys_el, "ServiceJourney", attrib={
                     "id": sj["id"], "version": "1"
                 })
-                ET.SubElement(el, "DayTypeRef", attrib={
+                dep_time, dep_offset = _normalize_time(sj["departure_time"])
+                ET.SubElement(el, "DepartureTime").text = dep_time
+                if dep_offset:
+                    ET.SubElement(el, "DepartureDayOffset").text = str(dep_offset)
+                day_types_el = ET.SubElement(el, "dayTypes")
+                ET.SubElement(day_types_el, "DayTypeRef", attrib={
                     "ref": sj["day_type_id"], "version": "1"
                 })
-                if sj.get("journey_pattern_id"):
+                jp_id = sj.get("journey_pattern_id")
+                if jp_id and self._jp_remap:
+                    jp_id = self._jp_remap.get(jp_id, jp_id)
+                if jp_id:
                     ET.SubElement(el, "JourneyPatternRef", attrib={
-                        "ref": sj["journey_pattern_id"], "version": "1"
+                        "ref": jp_id, "version": "1"
                     })
                 ET.SubElement(el, "LineRef", attrib={
                     "ref": sj["line_id"], "version": "1"
                 })
-                ET.SubElement(el, "DepartureTime").text = sj["departure_time"]
 
                 sj_pts = pt_by_journey.get(sj["id"], [])
                 if sj_pts:
@@ -246,12 +317,18 @@ class NetexExporter:
                         tpt = ET.SubElement(pt_el, "TimetabledPassingTime", attrib={
                             "version": "0"
                         })
-                        if sj.get("journey_pattern_id"):
+                        if jp_id:
                             ET.SubElement(tpt, "StopPointInJourneyPatternRef", attrib={
-                                "ref": f"{sj['journey_pattern_id']}_stop_{pt['order']}",
+                                "ref": f"{jp_id}_stop_{pt['order']}",
                                 "version": "1",
                             })
                         if pt.get("arrival_time"):
-                            ET.SubElement(tpt, "ArrivalTime").text = pt["arrival_time"]
+                            arr_t, arr_off = _normalize_time(pt["arrival_time"])
+                            ET.SubElement(tpt, "ArrivalTime").text = arr_t
+                            if arr_off:
+                                ET.SubElement(tpt, "ArrivalDayOffset").text = str(arr_off)
                         if pt.get("departure_time"):
-                            ET.SubElement(tpt, "DepartureTime").text = pt["departure_time"]
+                            dep_t, dep_off = _normalize_time(pt["departure_time"])
+                            ET.SubElement(tpt, "DepartureTime").text = dep_t
+                            if dep_off:
+                                ET.SubElement(tpt, "DepartureDayOffset").text = str(dep_off)
