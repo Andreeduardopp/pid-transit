@@ -44,7 +44,7 @@ def cmd_export(args):
     fmt = args.format
     if fmt == "gtfs":
         from .adapters.gtfs_exporter import GtfsExporter
-        exporter = GtfsExporter(include_shapes=args.include_shapes)
+        exporter = GtfsExporter(include_shapes=not args.no_shapes)
     elif fmt == "netex":
         from .adapters.netex_exporter import NetexExporter
         exporter = NetexExporter(
@@ -159,8 +159,8 @@ def main():
                           choices=["gtfs", "netex"],
                           help="Output format")
     p_export.add_argument("--output", "-o", required=True, help="Output file path")
-    p_export.add_argument("--include-shapes", action="store_true",
-                          help="Include shapes.txt in GTFS export")
+    p_export.add_argument("--no-shapes", action="store_true",
+                          help="Exclude shapes.txt from GTFS export (included by default)")
     p_export.add_argument("--no-dedup", action="store_true",
                           help="Disable journey pattern deduplication in NeTEx")
     p_export.add_argument("--compress", action="store_true",

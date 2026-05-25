@@ -6,13 +6,16 @@ with full referential integrity.
 """
 
 import sqlite3
+import logging
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from datetime import datetime, timezone
 
 from .schemas import TRANSMODEL_ENTITIES
 
-SCHEMA_VERSION = "2.0.0-transmodel"
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = "3.0.0-transmodel"
 
 _TABLE_SCHEMAS = {
     "operator": """
@@ -43,6 +46,41 @@ _TABLE_SCHEMAS = {
             lon                 REAL NOT NULL,
             stop_area_id        TEXT,
             wheelchair_boarding INTEGER
+        )
+    """,
+    "level": """
+        CREATE TABLE IF NOT EXISTS level (
+            id    TEXT PRIMARY KEY,
+            "index" REAL NOT NULL,
+            name  TEXT
+        )
+    """,
+    "stop_area": """
+        CREATE TABLE IF NOT EXISTS stop_area (
+            id                  TEXT PRIMARY KEY,
+            name                TEXT NOT NULL,
+            lat                 REAL,
+            lon                 REAL,
+            location_type       INTEGER NOT NULL DEFAULT 1,
+            parent_id           TEXT,
+            level_id            TEXT REFERENCES level(id),
+            wheelchair_boarding INTEGER
+        )
+    """,
+    "pathway": """
+        CREATE TABLE IF NOT EXISTS pathway (
+            id                     TEXT PRIMARY KEY,
+            from_stop_id           TEXT NOT NULL,
+            to_stop_id             TEXT NOT NULL,
+            pathway_mode           INTEGER NOT NULL,
+            is_bidirectional       INTEGER NOT NULL,
+            length                 REAL,
+            traversal_time         INTEGER,
+            stair_count            INTEGER,
+            max_slope              REAL,
+            min_width              REAL,
+            signposted_as          TEXT,
+            reversed_signposted_as TEXT
         )
     """,
     "day_type": """
@@ -146,6 +184,51 @@ _TABLE_SCHEMAS = {
             PRIMARY KEY (from_stop_id, to_stop_id)
         )
     """,
+    "fare_attribute": """
+        CREATE TABLE IF NOT EXISTS fare_attribute (
+            id                TEXT PRIMARY KEY,
+            price             REAL NOT NULL,
+            currency_type     TEXT NOT NULL,
+            payment_method    INTEGER NOT NULL,
+            transfers         INTEGER,
+            operator_id       TEXT REFERENCES operator(id),
+            transfer_duration INTEGER
+        )
+    """,
+    "fare_rule": """
+        CREATE TABLE IF NOT EXISTS fare_rule (
+            fare_id        TEXT NOT NULL REFERENCES fare_attribute(id),
+            route_id       TEXT NOT NULL DEFAULT '',
+            origin_id      TEXT NOT NULL DEFAULT '',
+            destination_id TEXT NOT NULL DEFAULT '',
+            contains_id    TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (fare_id, route_id, origin_id, destination_id, contains_id)
+        )
+    """,
+    "translation": """
+        CREATE TABLE IF NOT EXISTS translation (
+            table_name   TEXT NOT NULL,
+            field_name   TEXT NOT NULL,
+            language     TEXT NOT NULL,
+            translation  TEXT NOT NULL,
+            record_id    TEXT NOT NULL DEFAULT '',
+            record_sub_id TEXT NOT NULL DEFAULT '',
+            field_value  TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (table_name, field_name, language, record_id, field_value)
+        )
+    """,
+    "attribution": """
+        CREATE TABLE IF NOT EXISTS attribution (
+            id                 TEXT PRIMARY KEY,
+            organization_name  TEXT NOT NULL,
+            is_producer        INTEGER,
+            is_operator        INTEGER,
+            is_authority       INTEGER,
+            attribution_url    TEXT,
+            attribution_email  TEXT,
+            attribution_phone  TEXT
+        )
+    """,
     "_meta": """
         CREATE TABLE IF NOT EXISTS _meta (
             key   TEXT PRIMARY KEY,
@@ -171,6 +254,7 @@ class TransmodelDatabase:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = None
         self._ensure_schema()
+        self._migrate_schema()
 
     def connect(self) -> sqlite3.Connection:
         if self._in_memory:
@@ -204,6 +288,35 @@ class TransmodelDatabase:
             if close_after:
                 conn.close()
 
+    def _migrate_schema(self) -> None:
+        """Migrate an existing database to the current schema version if needed."""
+        conn = self.connect()
+        close_after = not self._in_memory
+        try:
+            cur = conn.execute("SELECT value FROM _meta WHERE key = 'schema_version'")
+            row = cur.fetchone()
+            stored_version = row[0] if row else None
+
+            if stored_version != SCHEMA_VERSION:
+                logger.info(
+                    "Migrating schema from %s to %s",
+                    stored_version or "unknown", SCHEMA_VERSION,
+                )
+                for ddl in _TABLE_SCHEMAS.values():
+                    conn.execute(ddl)
+                conn.execute(
+                    "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+                    ("schema_version", SCHEMA_VERSION),
+                )
+                conn.commit()
+        finally:
+            if close_after:
+                conn.close()
+
+    def _check_table(self, table_name: str) -> None:
+        if table_name not in _TABLE_SCHEMAS:
+            raise ValueError(f"Unknown table: {table_name}")
+
     def upsert(self, table_name: str, records: List[Dict[str, Any]]) -> int:
         """Upsert records into a Transmodel table."""
         if table_name not in TRANSMODEL_ENTITIES:
@@ -235,6 +348,7 @@ class TransmodelDatabase:
 
     def get_records(self, table_name: str) -> List[Dict[str, Any]]:
         """Fetch all records from a table."""
+        self._check_table(table_name)
         conn = self.connect()
         try:
             cur = conn.execute(f"SELECT * FROM {table_name}")
@@ -251,6 +365,7 @@ class TransmodelDatabase:
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch records with optional filtering, ordering, and limit."""
+        self._check_table(table_name)
         sql = f"SELECT * FROM {table_name}"
         params: list = []
         if where:
@@ -284,6 +399,7 @@ class TransmodelDatabase:
         self, table_name: str, where: Optional[Dict[str, Any]] = None
     ) -> int:
         """Count records, optionally filtered."""
+        self._check_table(table_name)
         sql = f"SELECT COUNT(*) FROM {table_name}"
         params: list = []
         if where:
@@ -303,6 +419,7 @@ class TransmodelDatabase:
 
     def delete(self, table_name: str, where: Dict[str, Any]) -> int:
         """Delete records matching the where clause. Returns count deleted."""
+        self._check_table(table_name)
         if not where:
             raise ValueError("where clause required for delete")
         clauses = []

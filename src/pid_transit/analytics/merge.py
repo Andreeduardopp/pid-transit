@@ -18,12 +18,16 @@ logger = logging.getLogger(__name__)
 _EARTH_RADIUS_M = 6_371_000
 
 _ID_TABLES = [
-    "operator", "line", "scheduled_stop_point", "day_type",
-    "journey_pattern", "service_journey", "feed_info",
+    "operator", "line", "scheduled_stop_point", "level", "stop_area", "pathway",
+    "day_type", "journey_pattern", "service_journey", "feed_info",
+    "fare_attribute", "attribution",
 ]
 
 _FK_MAP = {
     "line": {"operator_id": "operator"},
+    "stop_area": {"level_id": "level"},
+    "pathway": {"from_stop_id": "scheduled_stop_point",
+                "to_stop_id": "scheduled_stop_point"},
     "journey_pattern": {"line_id": "line"},
     "service_journey": {"line_id": "line", "journey_pattern_id": "journey_pattern",
                         "day_type_id": "day_type"},
@@ -36,6 +40,7 @@ _FK_MAP = {
     "transfer": {"from_stop_id": "scheduled_stop_point",
                  "to_stop_id": "scheduled_stop_point"},
     "shape_point": {},
+    "fare_rule": {"fare_id": "fare_attribute"},
 }
 
 

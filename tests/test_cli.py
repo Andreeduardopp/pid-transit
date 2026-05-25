@@ -40,7 +40,7 @@ class TestCLIExport:
 
         out_path = tmp_path / "export.zip"
         args = _Args(db=str(db_path), format="gtfs",
-                     output=str(out_path), include_shapes=False,
+                     output=str(out_path), no_shapes=True,
                      no_dedup=False, compress=False)
         cmd_export(args)
         assert out_path.exists()
@@ -54,7 +54,7 @@ class TestCLIExport:
 
         out_path = tmp_path / "export.xml"
         args = _Args(db=str(db_path), format="netex",
-                     output=str(out_path), include_shapes=False,
+                     output=str(out_path), no_shapes=True,
                      no_dedup=False, compress=False)
         cmd_export(args)
         assert out_path.exists()

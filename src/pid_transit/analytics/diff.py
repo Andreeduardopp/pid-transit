@@ -68,8 +68,9 @@ class FeedDiffReport:
 
 # Tables with a single 'id' primary key
 _ID_TABLES = [
-    "operator", "line", "scheduled_stop_point", "day_type",
-    "journey_pattern", "service_journey", "feed_info",
+    "operator", "line", "scheduled_stop_point", "level", "stop_area", "pathway",
+    "day_type", "journey_pattern", "service_journey", "feed_info",
+    "fare_attribute", "attribution",
 ]
 
 # Tables with composite keys
@@ -80,6 +81,8 @@ _COMPOSITE_TABLES = {
     "shape_point": ("shape_id", "sequence"),
     "frequency": ("service_journey_id", "start_time"),
     "transfer": ("from_stop_id", "to_stop_id"),
+    "fare_rule": ("fare_id", "route_id", "origin_id", "destination_id", "contains_id"),
+    "translation": ("table_name", "field_name", "language", "record_id", "field_value"),
 }
 
 

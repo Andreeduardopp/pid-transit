@@ -92,6 +92,9 @@ from .schemas import (
     OperatingDayException, JourneyPattern, PointInJourneyPattern,
     ServiceJourney, PassingTime,
     FeedInfo, ShapePoint, Frequency, Transfer,
+    Level, StopArea, Pathway,
+    FareAttribute, FareRule,
+    Translation, Attribution,
 )
 
 
@@ -111,6 +114,27 @@ class LineRepository(BaseRepository[Line]):
 class ScheduledStopPointRepository(BaseRepository[ScheduledStopPoint]):
     def __init__(self, db: TransmodelDatabase):
         super().__init__(db, "scheduled_stop_point", ScheduledStopPoint)
+
+
+class LevelRepository(BaseRepository[Level]):
+    def __init__(self, db: TransmodelDatabase):
+        super().__init__(db, "level", Level)
+
+
+class StopAreaRepository(BaseRepository[StopArea]):
+    def __init__(self, db: TransmodelDatabase):
+        super().__init__(db, "stop_area", StopArea)
+
+    def get_by_location_type(self, location_type: int) -> List[StopArea]:
+        return self.get_by_field("location_type", location_type)
+
+
+class PathwayRepository(BaseRepository[Pathway]):
+    def __init__(self, db: TransmodelDatabase):
+        super().__init__(db, "pathway", Pathway)
+
+    def get_by_stop(self, stop_id: str) -> List[Pathway]:
+        return self.get_by_field("from_stop_id", stop_id)
 
 
 class DayTypeRepository(BaseRepository[DayType]):
@@ -212,3 +236,33 @@ class TransferRepository(BaseRepository[Transfer]):
 
     def get_by_stop(self, stop_id: str) -> List[Transfer]:
         return self.get_by_field("from_stop_id", stop_id)
+
+
+class FareAttributeRepository(BaseRepository[FareAttribute]):
+    def __init__(self, db: TransmodelDatabase):
+        super().__init__(db, "fare_attribute", FareAttribute)
+
+
+class FareRuleRepository(BaseRepository[FareRule]):
+    def __init__(self, db: TransmodelDatabase):
+        super().__init__(db, "fare_rule", FareRule)
+
+    def get_by_fare(self, fare_id: str) -> List[FareRule]:
+        return self.get_by_field("fare_id", fare_id)
+
+
+class TranslationRepository(BaseRepository[Translation]):
+    def __init__(self, db: TransmodelDatabase):
+        super().__init__(db, "translation", Translation)
+
+    def get_for_record(self, table_name: str, record_id: str) -> List[Translation]:
+        records = self.db.query(
+            self.table_name,
+            where={"table_name": table_name, "record_id": record_id},
+        )
+        return [self.model_class(**r) for r in records]
+
+
+class AttributionRepository(BaseRepository[Attribution]):
+    def __init__(self, db: TransmodelDatabase):
+        super().__init__(db, "attribution", Attribution)

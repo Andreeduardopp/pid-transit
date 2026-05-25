@@ -11,7 +11,7 @@ from ..core.database import TransmodelDatabase
 
 logger = logging.getLogger(__name__)
 
-_NS = {"n": "http://www.netex.org.uk/netex"}
+_DEFAULT_NS = {"n": "http://www.netex.org.uk/netex"}
 
 _DAY_NAMES = {
     "monday": "Monday",
@@ -46,14 +46,28 @@ class NetexImporter:
 
     def __init__(self, fallback_timezone: str = "UTC"):
         self.fallback_timezone = fallback_timezone
+        self._ns: Dict[str, str] = dict(_DEFAULT_NS)
+
+    @staticmethod
+    def _detect_namespace(root: ET.Element) -> Dict[str, str]:
+        tag = root.tag
+        if tag.startswith("{"):
+            ns_uri = tag.split("}")[0].lstrip("{")
+            return {"n": ns_uri}
+        return dict(_DEFAULT_NS)
 
     def import_to_db(self, db: TransmodelDatabase, xml_path: Union[Path, str]) -> Dict[str, int]:
         """Import a NeTEx XML file into the database."""
         stats: Dict[str, int] = {}
 
-        logger.info(f"Parsing NeTEx XML: {xml_path}")
-        tree = ET.parse(xml_path)
+        logger.info("Parsing NeTEx XML: %s", xml_path)
+        try:
+            tree = ET.parse(xml_path)
+        except ET.ParseError as exc:
+            raise ImportError(f"Failed to parse NeTEx XML '{xml_path}': {exc}") from exc
         root = tree.getroot()
+
+        self._ns = self._detect_namespace(root)
 
         self._import_operators(root, db, stats)
         self._import_stops(root, db, stats)
@@ -66,13 +80,13 @@ class NetexImporter:
 
     def _import_operators(self, root: ET.Element, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
         operators = []
-        for op in root.findall(".//n:Operator", _NS):
+        for op in root.findall(".//n:Operator", self._ns):
             oid = op.attrib.get("id", "UNKNOWN")
-            name = _text(op.find("n:Name", _NS)) or "Unnamed"
+            name = _text(op.find("n:Name", self._ns)) or "Unnamed"
             phone = None
-            contact = op.find("n:ContactDetails", _NS)
+            contact = op.find("n:ContactDetails", self._ns)
             if contact is not None:
-                phone = _text(contact.find("n:Phone", _NS))
+                phone = _text(contact.find("n:Phone", self._ns))
             operators.append({
                 "id": oid,
                 "name": name,
@@ -81,23 +95,28 @@ class NetexImporter:
             })
         if operators:
             stats["operator"] = db.upsert("operator", operators)
+            logger.info("Imported %d operators", stats["operator"])
 
     def _import_stops(self, root: ET.Element, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
         stops = []
-        for sp in root.findall(".//n:StopPlace", _NS):
+        for sp in root.findall(".//n:StopPlace", self._ns):
             sid = sp.attrib.get("id")
             if not sid:
                 continue
-            name = _text(sp.find("n:Name", _NS)) or "Unnamed"
+            name = _text(sp.find("n:Name", self._ns)) or "Unnamed"
             lat, lon = None, None
-            centroid = sp.find("n:Centroid", _NS)
+            centroid = sp.find("n:Centroid", self._ns)
             if centroid is not None:
-                loc = centroid.find("n:Location", _NS)
+                loc = centroid.find("n:Location", self._ns)
                 if loc is not None:
-                    lat_t = _text(loc.find("n:Latitude", _NS))
-                    lon_t = _text(loc.find("n:Longitude", _NS))
+                    lat_t = _text(loc.find("n:Latitude", self._ns))
+                    lon_t = _text(loc.find("n:Longitude", self._ns))
                     if lat_t and lon_t:
-                        lat, lon = float(lat_t), float(lon_t)
+                        try:
+                            lat, lon = float(lat_t), float(lon_t)
+                        except (ValueError, TypeError):
+                            logger.warning("Invalid coordinates for StopPlace %s, skipping", sid)
+                            continue
             if lat is not None and lon is not None:
                 stops.append({
                     "id": sid,
@@ -107,19 +126,20 @@ class NetexImporter:
                 })
         if stops:
             stats["scheduled_stop_point"] = db.upsert("scheduled_stop_point", stops)
+            logger.info("Imported %d stops", stats["scheduled_stop_point"])
 
     def _import_day_types(self, root: ET.Element, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
         day_types = []
-        for dt in root.findall(".//n:DayType", _NS):
+        for dt in root.findall(".//n:DayType", self._ns):
             dtid = dt.attrib.get("id")
             if not dtid:
                 continue
             flags = {k: False for k in _DAY_NAMES}
-            props = dt.find("n:properties", _NS)
+            props = dt.find("n:properties", self._ns)
             if props is not None:
-                pod = props.find("n:PropertyOfDay", _NS)
+                pod = props.find("n:PropertyOfDay", self._ns)
                 if pod is not None:
-                    dow_text = _text(pod.find("n:DaysOfWeek", _NS)) or ""
+                    dow_text = _text(pod.find("n:DaysOfWeek", self._ns)) or ""
                     active_days = {d.strip() for d in dow_text.split()}
                     for field_name, day_name in _DAY_NAMES.items():
                         if day_name in active_days:
@@ -132,17 +152,18 @@ class NetexImporter:
             })
         if day_types:
             stats["day_type"] = db.upsert("day_type", day_types)
+            logger.info("Imported %d day types", stats["day_type"])
 
     def _import_lines(self, root: ET.Element, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
         lines = []
-        for line in root.findall(".//n:Line", _NS):
+        for line in root.findall(".//n:Line", self._ns):
             lid = line.attrib.get("id")
             if not lid:
                 continue
-            name = _text(line.find("n:Name", _NS)) or "Unnamed"
-            short_name = _text(line.find("n:ShortName", _NS))
-            mode = _text(line.find("n:TransportMode", _NS)) or "bus"
-            op_ref = line.find("n:OperatorRef", _NS)
+            name = _text(line.find("n:Name", self._ns)) or "Unnamed"
+            short_name = _text(line.find("n:ShortName", self._ns))
+            mode = _text(line.find("n:TransportMode", self._ns)) or "bus"
+            op_ref = line.find("n:OperatorRef", self._ns)
             operator_id = op_ref.attrib.get("ref") if op_ref is not None else None
             lines.append({
                 "id": lid,
@@ -153,32 +174,32 @@ class NetexImporter:
             })
         if lines:
             stats["line"] = db.upsert("line", lines)
+            logger.info("Imported %d lines", stats["line"])
 
     def _import_journey_patterns(self, root: ET.Element, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
         patterns = []
         points = []
-        for jp in root.findall(".//n:JourneyPattern", _NS):
+        for jp in root.findall(".//n:JourneyPattern", self._ns):
             jpid = jp.attrib.get("id")
             if not jpid:
                 continue
-            direction = _text(jp.find("n:DirectionType", _NS))
-            line_ref = jp.find("n:RouteRef", _NS)
+            direction = _text(jp.find("n:DirectionType", self._ns))
+            line_ref = jp.find("n:RouteRef", self._ns)
             line_id = None
             if line_ref is not None:
                 line_id = line_ref.attrib.get("ref")
 
-            # Try to find line_id from ServiceJourneys if not available on the pattern
             if not line_id:
-                for sj in root.findall(".//n:ServiceJourney", _NS):
-                    jp_ref = sj.find("n:JourneyPatternRef", _NS)
+                for sj in root.findall(".//n:ServiceJourney", self._ns):
+                    jp_ref = sj.find("n:JourneyPatternRef", self._ns)
                     if jp_ref is not None and jp_ref.attrib.get("ref") == jpid:
-                        lr = sj.find("n:LineRef", _NS)
+                        lr = sj.find("n:LineRef", self._ns)
                         if lr is not None:
                             line_id = lr.attrib.get("ref")
                             break
 
             if not line_id:
-                logger.warning(f"JourneyPattern {jpid} has no line reference, skipping")
+                logger.warning("JourneyPattern %s has no line reference, skipping", jpid)
                 continue
 
             patterns.append({
@@ -187,20 +208,21 @@ class NetexImporter:
                 "direction": direction,
             })
 
-            seq = jp.find("n:pointsInSequence", _NS)
+            seq = jp.find("n:pointsInSequence", self._ns)
             if seq is not None:
-                for spi in seq.findall("n:StopPointInJourneyPattern", _NS):
+                for spi in seq.findall("n:StopPointInJourneyPattern", self._ns):
                     order = int(spi.attrib.get("order", 0))
-                    ssp_ref = spi.find("n:ScheduledStopPointRef", _NS)
+                    ssp_ref = spi.find("n:ScheduledStopPointRef", self._ns)
                     if ssp_ref is not None:
                         points.append({
                             "journey_pattern_id": jpid,
                             "stop_point_id": ssp_ref.attrib.get("ref"),
-                            "order": order - 1,  # NeTEx is 1-indexed, we store 0-indexed
+                            "order": order - 1,
                         })
 
         if patterns:
             stats["journey_pattern"] = db.upsert("journey_pattern", patterns)
+            logger.info("Imported %d journey patterns", stats["journey_pattern"])
         if points:
             stats["point_in_journey_pattern"] = db.upsert("point_in_journey_pattern", points)
 
@@ -208,27 +230,27 @@ class NetexImporter:
         journeys = []
         passing_times = []
 
-        for sj in root.findall(".//n:ServiceJourney", _NS):
+        for sj in root.findall(".//n:ServiceJourney", self._ns):
             sjid = sj.attrib.get("id")
             if not sjid:
                 continue
 
-            dep_time_text = _text(sj.find("n:DepartureTime", _NS)) or "00:00:00"
-            dep_offset_text = _text(sj.find("n:DepartureDayOffset", _NS))
+            dep_time_text = _text(sj.find("n:DepartureTime", self._ns)) or "00:00:00"
+            dep_offset_text = _text(sj.find("n:DepartureDayOffset", self._ns))
             dep_offset = int(dep_offset_text) if dep_offset_text else 0
             departure_time = _reconstruct_time(dep_time_text, dep_offset)
 
-            line_ref = sj.find("n:LineRef", _NS)
+            line_ref = sj.find("n:LineRef", self._ns)
             line_id = line_ref.attrib.get("ref") if line_ref is not None else None
 
-            jp_ref = sj.find("n:JourneyPatternRef", _NS)
+            jp_ref = sj.find("n:JourneyPatternRef", self._ns)
             jp_id = jp_ref.attrib.get("ref") if jp_ref is not None else None
 
-            dt_ref = sj.find(".//n:DayTypeRef", _NS)
+            dt_ref = sj.find(".//n:DayTypeRef", self._ns)
             day_type_id = dt_ref.attrib.get("ref") if dt_ref is not None else "UNKNOWN"
 
             if not line_id:
-                logger.warning(f"ServiceJourney {sjid} has no LineRef, skipping")
+                logger.warning("ServiceJourney %s has no LineRef, skipping", sjid)
                 continue
 
             journeys.append({
@@ -239,41 +261,40 @@ class NetexImporter:
                 "departure_time": departure_time,
             })
 
-            pt_container = sj.find("n:passingTimes", _NS)
+            pt_container = sj.find("n:passingTimes", self._ns)
             if pt_container is not None:
-                # Build a mapping from StopPointInJourneyPattern refs to stop_point_ids
                 spi_to_stop = {}
                 if jp_id:
-                    for jp in root.findall(".//n:JourneyPattern", _NS):
+                    for jp in root.findall(".//n:JourneyPattern", self._ns):
                         if jp.attrib.get("id") == jp_id:
-                            seq = jp.find("n:pointsInSequence", _NS)
+                            seq = jp.find("n:pointsInSequence", self._ns)
                             if seq is not None:
-                                for spi in seq.findall("n:StopPointInJourneyPattern", _NS):
+                                for spi in seq.findall("n:StopPointInJourneyPattern", self._ns):
                                     spi_id = spi.attrib.get("id")
-                                    ssp_ref = spi.find("n:ScheduledStopPointRef", _NS)
+                                    ssp_ref = spi.find("n:ScheduledStopPointRef", self._ns)
                                     if spi_id and ssp_ref is not None:
                                         spi_to_stop[spi_id] = ssp_ref.attrib.get("ref")
                             break
 
                 order = 0
-                for tpt in pt_container.findall("n:TimetabledPassingTime", _NS):
+                for tpt in pt_container.findall("n:TimetabledPassingTime", self._ns):
                     stop_id = None
-                    spi_ref = tpt.find("n:StopPointInJourneyPatternRef", _NS)
+                    spi_ref = tpt.find("n:StopPointInJourneyPatternRef", self._ns)
                     if spi_ref is not None:
                         spi_id = spi_ref.attrib.get("ref")
                         stop_id = spi_to_stop.get(spi_id)
 
                     arr_time = None
-                    arr_text = _text(tpt.find("n:ArrivalTime", _NS))
+                    arr_text = _text(tpt.find("n:ArrivalTime", self._ns))
                     if arr_text:
-                        arr_off_text = _text(tpt.find("n:ArrivalDayOffset", _NS))
+                        arr_off_text = _text(tpt.find("n:ArrivalDayOffset", self._ns))
                         arr_off = int(arr_off_text) if arr_off_text else 0
                         arr_time = _reconstruct_time(arr_text, arr_off)
 
                     dep_time = None
-                    dep_text = _text(tpt.find("n:DepartureTime", _NS))
+                    dep_text = _text(tpt.find("n:DepartureTime", self._ns))
                     if dep_text:
-                        dep_off_text = _text(tpt.find("n:DepartureDayOffset", _NS))
+                        dep_off_text = _text(tpt.find("n:DepartureDayOffset", self._ns))
                         dep_off = int(dep_off_text) if dep_off_text else 0
                         dep_time = _reconstruct_time(dep_text, dep_off)
 
@@ -289,5 +310,7 @@ class NetexImporter:
 
         if journeys:
             stats["service_journey"] = db.upsert("service_journey", journeys)
+            logger.info("Imported %d service journeys", stats["service_journey"])
         if passing_times:
             stats["passing_time"] = db.upsert("passing_time", passing_times)
+            logger.info("Imported %d passing times", stats["passing_time"])

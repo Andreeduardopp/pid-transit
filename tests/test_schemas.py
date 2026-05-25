@@ -201,10 +201,13 @@ class TestAccessibilityFields:
 class TestEntityRegistry:
     def test_has_all_entities(self):
         expected = {
-            "operator", "line", "scheduled_stop_point", "day_type",
-            "operating_day_exception", "journey_pattern",
+            "operator", "line", "scheduled_stop_point",
+            "level", "stop_area", "pathway",
+            "day_type", "operating_day_exception", "journey_pattern",
             "point_in_journey_pattern", "service_journey", "passing_time",
             "feed_info", "shape_point", "frequency", "transfer",
+            "translation", "attribution",
+            "fare_attribute", "fare_rule",
         }
         assert expected == set(TRANSMODEL_ENTITIES.keys())
 

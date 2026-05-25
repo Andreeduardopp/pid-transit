@@ -86,6 +86,7 @@ class NetexExporter:
         return remap, canonical_ids
 
     def export_from_db(self, db: TransmodelDatabase, output_path: Union[Path, str]) -> None:
+        logger.info("Exporting NeTEx to %s", output_path)
         if self.deduplicate_patterns:
             self._jp_remap, self._canonical_jps = self._build_pattern_dedup_map(db)
         else:

@@ -45,9 +45,10 @@ class SpreadsheetImporter:
             db: TransmodelDatabase instance.
             source_path: Path to the .xlsx file or the directory containing .csv files.
         """
+        logger.info("Importing spreadsheet from %s (format=%s)", source_path, self.format)
         path = Path(source_path)
         stats = {}
-        
+
         if self.format == "xlsx":
             if not HAS_OPENPYXL:
                 raise ImportFailedError("openpyxl is required to import Excel files. Install via 'pip install openpyxl'")
@@ -59,7 +60,7 @@ class SpreadsheetImporter:
                 for sheet_name in wb.sheetnames:
                     entity_name = sheet_name.lower().strip()
                     if entity_name not in TRANSMODEL_ENTITIES:
-                        logger.warning(f"Skipping sheet '{sheet_name}', not a recognized Transmodel entity.")
+                        logger.warning("Skipping sheet '%s', not a recognized Transmodel entity.", sheet_name)
                         continue
                         
                     sheet = wb[sheet_name]
@@ -93,7 +94,7 @@ class SpreadsheetImporter:
             for file_path in path.glob("*.csv"):
                 entity_name = file_path.stem.lower().strip()
                 if entity_name not in TRANSMODEL_ENTITIES:
-                    logger.warning(f"Skipping file '{file_path.name}', not a recognized Transmodel entity.")
+                    logger.warning("Skipping file '%s', not a recognized Transmodel entity.", file_path.name)
                     continue
                     
                 try:

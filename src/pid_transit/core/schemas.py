@@ -110,6 +110,42 @@ class PassingTime(BaseModel):
     departure_time: Optional[str] = Field(None, description="HH:MM:SS format")
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Station Topology
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Level(BaseModel):
+    """Multi-level station support / GTFS 'levels.txt'."""
+    id: str = Field(..., description="Unique level identifier")
+    index: float = Field(..., description="Numeric index, 0=ground, negative=below")
+    name: Optional[str] = Field(None, description="Human-readable level name")
+
+class StopArea(BaseModel):
+    """Non-platform stop locations / GTFS stop with location_type >= 1."""
+    id: str = Field(..., description="Unique stop area identifier")
+    name: str = Field(..., description="Public name")
+    lat: Optional[float] = Field(None, ge=-90, le=90)
+    lon: Optional[float] = Field(None, ge=-180, le=180)
+    location_type: int = Field(1, description="1=station, 2=entrance, 3=node, 4=boarding_area")
+    parent_id: Optional[str] = Field(None, description="Self-referencing parent stop area")
+    level_id: Optional[str] = Field(None, description="Reference to Level.id")
+    wheelchair_boarding: Optional[int] = Field(None, description="0=no info, 1=yes, 2=no")
+
+class Pathway(BaseModel):
+    """Station interior connectivity / GTFS 'pathways.txt'."""
+    id: str = Field(..., description="Unique pathway identifier")
+    from_stop_id: str = Field(..., description="Reference to stop or stop area")
+    to_stop_id: str = Field(..., description="Reference to stop or stop area")
+    pathway_mode: int = Field(..., description="1=walkway, 2=stairs, 3=travelator, 4=escalator, 5=elevator, 6=fare_gate, 7=exit_gate")
+    is_bidirectional: bool = Field(...)
+    length: Optional[float] = Field(None, description="Horizontal length in meters")
+    traversal_time: Optional[int] = Field(None, description="Seconds to traverse")
+    stair_count: Optional[int] = Field(None)
+    max_slope: Optional[float] = Field(None)
+    min_width: Optional[float] = Field(None, description="Minimum width in meters")
+    signposted_as: Optional[str] = Field(None)
+    reversed_signposted_as: Optional[str] = Field(None)
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Supplementary Entities
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -148,11 +184,53 @@ class Transfer(BaseModel):
     transfer_type: int = Field(0, description="0=recommended, 1=timed, 2=min_time, 3=none")
     min_transfer_time: Optional[int] = Field(None, description="Minimum transfer time in seconds")
 
+class Translation(BaseModel):
+    """Multi-language text / GTFS 'translations.txt'."""
+    table_name: str = Field(..., description="GTFS table name (e.g., 'stops')")
+    field_name: str = Field(..., description="GTFS field name (e.g., 'stop_name')")
+    language: str = Field(..., description="BCP-47 language code")
+    translation: str = Field(..., description="Translated text")
+    record_id: str = Field(default="", description="ID of the record being translated")
+    record_sub_id: str = Field(default="", description="Sub-record ID for compound keys")
+    field_value: str = Field(default="", description="Value to match when record_id absent")
+
+class FareAttribute(BaseModel):
+    """Fare pricing / GTFS 'fare_attributes.txt'."""
+    id: str = Field(..., description="Unique fare identifier")
+    price: float = Field(..., description="Fare price")
+    currency_type: str = Field(..., description="ISO 4217 currency code")
+    payment_method: int = Field(..., description="0=on board, 1=before boarding")
+    transfers: Optional[int] = Field(None, description="Number of transfers allowed (empty=unlimited)")
+    operator_id: Optional[str] = Field(None, description="Reference to Operator.id")
+    transfer_duration: Optional[int] = Field(None, description="Transfer window in seconds")
+
+class FareRule(BaseModel):
+    """Fare applicability rule / GTFS 'fare_rules.txt'."""
+    fare_id: str = Field(..., description="Reference to FareAttribute.id")
+    route_id: str = Field(default="", description="Reference to Line.id")
+    origin_id: str = Field(default="", description="Origin zone ID")
+    destination_id: str = Field(default="", description="Destination zone ID")
+    contains_id: str = Field(default="", description="Zone the trip passes through")
+
+class Attribution(BaseModel):
+    """Dataset attribution / GTFS 'attributions.txt'."""
+    id: str = Field(default="default_attribution", description="Attribution identifier")
+    organization_name: str = Field(..., description="Organization name")
+    is_producer: Optional[bool] = Field(None)
+    is_operator: Optional[bool] = Field(None)
+    is_authority: Optional[bool] = Field(None)
+    attribution_url: Optional[str] = Field(None)
+    attribution_email: Optional[str] = Field(None)
+    attribution_phone: Optional[str] = Field(None)
+
 # Registry of all core models for database iteration
 TRANSMODEL_ENTITIES = {
     "operator": Operator,
     "line": Line,
     "scheduled_stop_point": ScheduledStopPoint,
+    "level": Level,
+    "stop_area": StopArea,
+    "pathway": Pathway,
     "day_type": DayType,
     "operating_day_exception": OperatingDayException,
     "journey_pattern": JourneyPattern,
@@ -163,4 +241,8 @@ TRANSMODEL_ENTITIES = {
     "shape_point": ShapePoint,
     "frequency": Frequency,
     "transfer": Transfer,
+    "fare_attribute": FareAttribute,
+    "fare_rule": FareRule,
+    "translation": Translation,
+    "attribution": Attribution,
 }

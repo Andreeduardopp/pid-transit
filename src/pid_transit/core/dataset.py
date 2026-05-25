@@ -11,6 +11,9 @@ from .repositories import (
     OperatorRepository,
     LineRepository,
     ScheduledStopPointRepository,
+    LevelRepository,
+    StopAreaRepository,
+    PathwayRepository,
     DayTypeRepository,
     OperatingDayExceptionRepository,
     JourneyPatternRepository,
@@ -21,6 +24,10 @@ from .repositories import (
     ShapePointRepository,
     FrequencyRepository,
     TransferRepository,
+    FareAttributeRepository,
+    FareRuleRepository,
+    TranslationRepository,
+    AttributionRepository,
 )
 from .exceptions import ImportFailedError
 
@@ -42,6 +49,9 @@ class TransitDataset:
         self.operators = OperatorRepository(self.db)
         self.lines = LineRepository(self.db)
         self.scheduled_stop_points = ScheduledStopPointRepository(self.db)
+        self.levels = LevelRepository(self.db)
+        self.stop_areas = StopAreaRepository(self.db)
+        self.pathways = PathwayRepository(self.db)
         self.day_types = DayTypeRepository(self.db)
         self.operating_day_exceptions = OperatingDayExceptionRepository(self.db)
         self.journey_patterns = JourneyPatternRepository(self.db)
@@ -52,6 +62,10 @@ class TransitDataset:
         self.shape_points = ShapePointRepository(self.db)
         self.frequencies = FrequencyRepository(self.db)
         self.transfers = TransferRepository(self.db)
+        self.fare_attributes = FareAttributeRepository(self.db)
+        self.fare_rules = FareRuleRepository(self.db)
+        self.translations = TranslationRepository(self.db)
+        self.attributions = AttributionRepository(self.db)
 
     def import_data(self, importer, source: Union[str, Path]) -> Dict[str, int]:
         """
