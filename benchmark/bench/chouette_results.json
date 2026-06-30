@@ -1,0 +1,109 @@
+{
+  "config": {
+    "reps": 3,
+    "warmup": 1,
+    "profile": "european",
+    "out": "/tmp/claude-1000/-home-developer-Documentos-mestrado-optisus-pid-toolkit/96cf2076-87f7-41ad-aa2c-b43437bf3240/scratchpad/bench/chouette_results.json"
+  },
+  "db_cgroup_peak_mb": 846.30859375,
+  "db_size": "128 MB",
+  "artifact": "7371491 /out/chouette_netex_european.zip",
+  "results": {
+    "gtfs_import": {
+      "name": "chouette GTFS import (GTFS -> PostGIS Referential)",
+      "reps": 3,
+      "op_s": {
+        "mean": 323.6666666666667,
+        "sd": 6.127693883781504,
+        "min": 316.603,
+        "max": 327.555
+      },
+      "full_wall_s": {
+        "mean": 329.28663136532606,
+        "sd": 6.136563621516215,
+        "min": 322.2089757389622,
+        "max": 333.12127365899505
+      },
+      "worker_rss_mb": {
+        "mean": 782.3932291666666,
+        "sd": 4.318783517680777,
+        "min": 777.41796875,
+        "max": 785.17578125
+      },
+      "raw": [
+        {
+          "rc": 0,
+          "full_wall_s": 332.529644698021,
+          "op_s": 326.842,
+          "worker_rss_mb": 777.41796875,
+          "stdout": "OP_SECONDS=326.842\nREFERENTIAL_ID=2\nIMPORT_STATUS=\"successful\"\nVEHICLE_JOURNEYS=12722\nJOURNEY_PATTERNS=220\nVJAS_PASSING_TIMES=461359\nSTOP_POINTS=5287\nROUTES=138\nIMPORT_OK\n",
+          "stderr_tail": "\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0"
+        },
+        {
+          "rc": 0,
+          "full_wall_s": 322.2089757389622,
+          "op_s": 316.603,
+          "worker_rss_mb": 785.17578125,
+          "stdout": "OP_SECONDS=316.603\nREFERENTIAL_ID=3\nIMPORT_STATUS=\"successful\"\nVEHICLE_JOURNEYS=12722\nJOURNEY_PATTERNS=220\nVJAS_PASSING_TIMES=461359\nSTOP_POINTS=5287\nROUTES=138\nIMPORT_OK\n",
+          "stderr_tail": "\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0"
+        },
+        {
+          "rc": 0,
+          "full_wall_s": 333.12127365899505,
+          "op_s": 327.555,
+          "worker_rss_mb": 784.5859375,
+          "stdout": "OP_SECONDS=327.555\nREFERENTIAL_ID=4\nIMPORT_STATUS=\"successful\"\nVEHICLE_JOURNEYS=12722\nJOURNEY_PATTERNS=220\nVJAS_PASSING_TIMES=461359\nSTOP_POINTS=5287\nROUTES=138\nIMPORT_OK\n",
+          "stderr_tail": "\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0"
+        }
+      ]
+    },
+    "netex_export": {
+      "name": "chouette NeTEx export (Referential -> NeTEx, profile=european)",
+      "reps": 3,
+      "op_s": {
+        "mean": 98.00699999999999,
+        "sd": 0.764635861047595,
+        "min": 97.339,
+        "max": 98.841
+      },
+      "full_wall_s": {
+        "mean": 102.87140666967025,
+        "sd": 0.7765344869008267,
+        "min": 102.23197231598897,
+        "max": 103.7355029330356
+      },
+      "worker_rss_mb": {
+        "mean": 467.8723958333333,
+        "sd": 14.841980945844456,
+        "min": 456.08203125,
+        "max": 484.5390625
+      },
+      "raw": [
+        {
+          "rc": 0,
+          "full_wall_s": 102.64674475998618,
+          "op_s": 97.841,
+          "worker_rss_mb": 456.08203125,
+          "stdout": "OP_SECONDS=97.841\nEXPORT_STATUS=\"successful\"\nARTIFACT=/out/chouette_netex_european.zip\nARTIFACT_BYTES=7371504\nEXPORT_OK\n",
+          "stderr_tail": "\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0"
+        },
+        {
+          "rc": 0,
+          "full_wall_s": 102.23197231598897,
+          "op_s": 97.339,
+          "worker_rss_mb": 462.99609375,
+          "stdout": "OP_SECONDS=97.339\nEXPORT_STATUS=\"successful\"\nARTIFACT=/out/chouette_netex_european.zip\nARTIFACT_BYTES=7371504\nEXPORT_OK\n",
+          "stderr_tail": "\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0"
+        },
+        {
+          "rc": 0,
+          "full_wall_s": 103.7355029330356,
+          "op_s": 98.841,
+          "worker_rss_mb": 484.5390625,
+          "stdout": "OP_SECONDS=98.841\nEXPORT_STATUS=\"successful\"\nARTIFACT=/out/chouette_netex_european.zip\nARTIFACT_BYTES=7371491\nEXPORT_OK\n",
+          "stderr_tail": "\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0"
+        }
+      ]
+    }
+  }
+}

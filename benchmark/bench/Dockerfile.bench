@@ -1,0 +1,34 @@
+# Benchmark image for chouette-core.
+# The upstream Dockerfile builds FROM a PRIVATE enroute registry image
+# (enroute-ruby:3.4) plus internal build.sh tooling, which we cannot pull.
+# So we reproduce the runtime from the public ruby:3.4 image + the system
+# libraries the native gems need (pg, rgeo/activerecord-postgis-adapter ->
+# geos/proj/gdal, nokogiri -> libxml2/libxslt).
+FROM ruby:3.4-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential git curl ca-certificates \
+      cmake pkg-config \
+      libpq-dev postgresql-client \
+      libgeos-dev libproj-dev proj-bin libgdal-dev gdal-bin \
+      libxml2-dev libxslt1-dev libyaml-dev zlib1g-dev \
+      nodejs npm \
+      libjemalloc2 tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# Time the Ruby process precisely (Maximum resident set size + wall clock).
+# GNU time lives in the `time` package on Debian.
+RUN apt-get update && apt-get install -y --no-install-recommends time \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Bundler config: skip the production-only group (mini_racer/V8 native build we
+# don't need) but KEEP development+test so factory_bot/faker are installed for
+# domain seeding. Gems live in a named volume mounted at /usr/local/bundle.
+ENV BUNDLE_PATH=/usr/local/bundle \
+    BUNDLE_WITHOUT=production \
+    LANG=C.UTF-8
+
+CMD ["sleep", "infinity"]

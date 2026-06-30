@@ -1,8 +1,9 @@
 # PID-Transit — Comparative Benchmarking (draft data for §4.4)
 
-> Status: PID-transit self-benchmark **complete**. Competitor timed runs **pending a
-> decision** (NeTEx profile-compatibility blocker, see §3). Footprint table below uses
-> structural facts only; quantitative cells marked *(measure)* still need Docker/build.
+> Status: PID-transit self-benchmark **complete**. Competitor timed head-to-heads **done**:
+> **Theoremus** (§3.4, Go NeTEx→GTFS) and **chouette-core** (§4.1, the persistent-system-of-
+> record analogue — GTFS import + NeTEx export, now run to completion on Docker). Remaining
+> *(measure)* cells are the legacy-Chouette / Entur container images (footprint-only).
 
 ## 1. Test environment
 
@@ -55,7 +56,7 @@ Notes for the paper:
 | **Entur** `netex-gtfs-converter-java` | Java | **Library** (Maven Central `org.entur:netex-gtfs-converter-java` 3.0.2) | Nordic profile; **two** datasets (separate stops/quays + timetable), zipped; codespace | Maven + custom Java `main` (Java 26 present) | Hard — incompatible with our single-file EPIP export |
 | **Theoremus** `netex-gtfs-converter` | Go | **CLI** | European profile; NeTEx **zip**; `--codespace` | Install Go ≥1.21, `make build` | Most viable — but still needs Entur-style zip input |
 | Chouette legacy | Java EE | Service | — | WildFly + PostgreSQL (Docker) | Footprint-only (no Docker here) |
-| chouette-core | Ruby/Rails | Service | — | Rails + PostGIS + Redis + delayed_job worker | Footprint-only (no Docker here) |
+| chouette-core | Ruby/Rails | Service | GTFS zip (own importer) | Rails + PostGIS (+Redis/worker in prod) | **Timed head-to-head done — see §4.1** |
 
 **Blocker:** both converters expect Entur/Nordic-style NeTEx (zipped, codespace,
 split stops-vs-timetable frames). PID-transit emits a single EPIP-style XML, so a
@@ -159,7 +160,7 @@ system of record instead of a one-shot conversion, with zero infrastructure."
 | DB server required | no (embedded SQLite) | no | no | **yes** | **yes** |
 | 3rd-party deps | **2 declared / 7 closure** | 0 runtime | JVM + jar graph | **138 top-level / 348 closure** (`Gemfile.lock`) | Java EE stack |
 | Persistent queryable store | **yes (SQLite)** | no (file→file) | no (file→file) | yes (PostGIS) | yes (Postgres) |
-| Container image | *(measure)* python-slim + pure-py | *(measure)* ~static, smallest | *(measure)* JRE-based | Ruby 3.4 base + PostGIS + Redis (not measured — no Docker on bench) | *(measure)* largest |
+| Container image | *(measure)* python-slim + pure-py | *(measure)* ~static, smallest | *(measure)* JRE-based | **app 1.58 GB (Ruby 3.4 + geo libs) + 474 MB gems + PostGIS 609 MB** (measured, §4.1) | *(measure)* largest |
 
 **Honest framing:** PID-transit's footprint win is decisive against the
 DB+app-server tools (Chouette family) and favorable vs Entur-in-practice. Against a
@@ -169,12 +170,68 @@ size — Theoremus is leaner. PID-transit's distinguishing value there is the
 footprint. The ~85 MB DB / higher RAM is the cost of being a system-of-record rather
 than a one-shot file→file converter.
 
-### 4.1 chouette-core — grounded footprint (timed runs deferred; see `CHOUETTE_PLAN.md`)
+### 4.1 chouette-core — timed head-to-head (COMPLETED) + grounded footprint
 
-Per `CHOUETTE_PLAN.md` §6, the timed head-to-head was time-boxed against Docker
-availability. **Docker and a Ruby toolchain are not installed on the bench machine**,
-so the wall-clock/RAM rows are deferred. The footprint row below is fully grounded — it
-comes from a shallow clone of `enroute-mobi/chouette-core` (master), not estimation.
+> **Update — executed.** `CHOUETTE_PLAN.md` time-boxed this against Docker availability;
+> the §1 bench machine (Windows) had none. It has since been **run to completion on a
+> Linux workstation** — 16 logical cores, 34.6 GB RAM, **Docker 29 + Compose v2**, Ruby
+> **3.4.9**, CPython 3.12 — bringing chouette-core up from a clean clone of
+> `enroute-mobi/chouette-core` (master). **PID-Transit was re-baselined on the same
+> machine** so the head-to-head is hardware-fair. Full method + scripts in
+> `benchmark/bench/` (`Dockerfile.bench`, `docker-compose.yml`, `runner/`, `chouette_bench.py`);
+> PID-Transit's same-machine baseline in `benchmark/results_linux/`.
+
+**Bring-up (reproducible).** The upstream `Dockerfile` builds `FROM` a *private* enroute
+registry image (`enroute-ruby:3.4`) plus internal `build.sh` tooling, so it is not usable
+externally; a minimal equivalent was authored from public `ruby:3.4` + the native-gem
+system libraries (`geos`/`proj`/`gdal` for the PostGIS adapter, `libpq`, `libxml2`,
+`cmake` for `rugged`). The benchmark stack is **2 containers** — PostGIS + the Ruby app —
+because, per plan §3, both operations run **synchronously inline** via `rails runner`, so
+Redis, the delayed_job worker and the web frontend are not needed. The engine gems
+(`gtfs`, `netex`, …) install from **public Bitbucket** git sources. The domain graph is
+seeded with a single `FactoryBot.create(:workbench)` using the generic **`netex`** objectid
+format (the factory default `stif_codifligne` is France-specific and silently drops every
+non-French line). Operations driven: `Import::Gtfs#import` and a synchronous
+`Export::NetexGeneric` (EPIP / `european` profile, full-referential scope).
+
+**Equal work, verified.** chouette's import produces **461 359 passing times / 12 722
+vehicle journeys** — *identical* entity counts to PID-Transit on the same feed — so this is
+a valid equal-work comparison, not a partial conversion. (chouette dedups to 220 journey
+patterns, the same dedup PID-Transit applies on NeTEx export.)
+
+**Measured** (N = 3 timed + 1 warmup; `T_exec` = in-process operation time, which *excludes*
+the ~5 s Rails boot — reported as the boot tax — analogous to PID-Transit's negligible
+Python startup):
+
+| Operation — Porto (71 lines, 2 550 stops, 12 722 journeys, 461 359 passing times) | chouette-core | PID-Transit (same machine) | ratio |
+|---|---|---|---|
+| **GTFS import — T_exec** | **323.7 ± 6.1 s** | **12.76 ± 1.87 s** | **≈ 25× slower** |
+| GTFS import — worker RSS | 785 MB | 402 MB | 2.0× |
+| **NeTEx export — T_exec** | **98.0 ± 0.8 s** | **10.98 ± 0.08 s** | **≈ 9× slower** |
+| NeTEx export — worker RSS | 485 MB | 777 MB | **0.6× (chouette lower)** |
+| Persistent store size | 128 MB (PostGIS) | 84.7 MB (embedded SQLite) | 1.5× |
+| **DB-server standing RAM** | **846 MB (PostGIS container peak)** | **0 (embedded)** | — |
+| Export artifact | 7.4 MB (EPIP zip, 73 files) | 144.8 MB (single XML) | zipped vs raw — see note |
+| Boot tax / invocation | ~5 s (Rails) | ~0.1 s (Python) | — |
+
+**Reading the result.**
+- **Speed:** chouette is **~25× slower on import** and **~9× slower on export** for byte-for-byte
+  equivalent output. That is the cost of a full data-management platform — PostGIS spatial
+  storage, schema validation, multi-tenant referential isolation (each import builds a *new*
+  PostgreSQL schema via Apartment), and dataset versioning (the overlapping-validity-period
+  guard that, by design, refuses to re-import the same feed window). PID-Transit performs a
+  focused GTFS→SQLite mapping.
+- **Worker memory is a wash; infrastructure memory is not.** chouette's *export* uses **less**
+  worker RAM (485 vs 777 MB) because it streams one NeTEx file per line, whereas
+  PID-Transit builds the whole XML tree in memory (its known hot-spot, §2). But chouette
+  additionally carries an **846 MB PostGIS server** that PID-Transit's embedded SQLite
+  avoids entirely, so total resident footprint still favours PID-Transit decisively.
+- **Artifact:** chouette emits EPIP as a **multi-file zip** (`stops.xml` + `common.xml` + one
+  `line-*.xml` per line; ~100 MB uncompressed → 7.4 MB zipped); PID-Transit emits a single
+  uncompressed 144.8 MB XML. The sizes are not directly comparable (compression + packaging
+  differ); both encode the same 461 359 passing times.
+
+The footprint facts below come from the same clone, not estimation.
 
 | Fact | Value | Source |
 |---|---|---|
@@ -190,16 +247,23 @@ comes from a shallow clone of `enroute-mobi/chouette-core` (master), not estimat
 | NeTEx export op | `Export::NetexGeneric` | `app/models/export/netex_generic.rb` |
 | Domain graph for an import | `Organisation → Workgroup → Workbench → Referential` (all present as models) | `app/models/` |
 
-**Corrections to `CHOUETTE_PLAN.md` found during this pass** (apply before any future
-bring-up): (1) the license is **AGPL-3.0**, not CeCILL-B as §0 states; (2) there is
-**no `docker-compose.yml` in-tree** — only a bare `Dockerfile` — so §2 step 2 resolves
-to "author one from scratch", raising bring-up cost; (3) the confirmed export class is
-`Export::NetexGeneric`.
+**Corrections to `CHOUETTE_PLAN.md` confirmed during the bring-up** (apply before any
+future run): (1) the license is **AGPL-3.0**, not CeCILL-B as §0 states; (2) there is
+**no `docker-compose.yml` in-tree** — only a bare `Dockerfile` — so §2 step 2 resolves to
+"author one from scratch"; (3) that `Dockerfile` builds `FROM` a **private** enroute base
+image + `build.sh` tooling, so it cannot be used externally — a public-`ruby:3.4` image
+must be authored instead (done); (4) the confirmed classes are `Import::Gtfs` and
+`Export::NetexGeneric`; (5) for *inline* timing (plan §3) **Redis and the delayed_job
+worker are not required** — the stack reduces to PostGIS + the Ruby app (2 containers).
 
-**Architectural-parity result (the publishable point, per plan §5):** PID-transit and
-chouette-core fill the *same role* — both are persistent systems of record, not
-file→file converters — yet PID-transit delivers import + query + export with **0
-background services, 1 process, embedded SQLite, 2 declared deps**, whereas
-chouette-core requires **PostGIS + Redis + a delayed_job worker + a Rails app, with a
-348-gem dependency closure**. Same role, ~order-of-magnitude less infrastructure. That
-contrast stands on its own without a Chouette wall-clock number.
+**Architectural-parity result (the publishable point, per plan §5) — now with numbers.**
+PID-Transit and chouette-core fill the *same role* — both are persistent, queryable systems
+of record, unlike the file→file converters (Theoremus, Entur). For that identical role and
+*identical output* (461 359 passing times), PID-Transit delivers import + query + export with
+**1 process, embedded SQLite, 2 declared deps, 0 background services, and a ~13 s import**,
+whereas chouette-core requires **PostGIS (+ Redis + a delayed_job worker + a Rails app in
+production), 347 installed gems / 348-gem closure, and a ~324 s import**. Same role,
+**~order-of-magnitude less infrastructure *and* ~9–25× faster** on this dataset — while both
+retain the persistent relational store that separates them from one-shot converters. That is
+a stronger result than the footprint contrast alone, which the plan (§6) had treated as the
+fallback.
