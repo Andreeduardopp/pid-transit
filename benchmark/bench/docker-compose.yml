@@ -1,0 +1,48 @@
+# Minimal chouette-core stack for inline (rails runner) benchmarking.
+# Per CHOUETTE_PLAN.md §3 we run operations synchronously via `rails runner`,
+# so we DON'T need Redis, the delayed_job worker, or the web frontend — only
+# a PostGIS database and a Ruby app container.
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: chouette-bench-db
+    environment:
+      POSTGRES_USER: chouette
+      POSTGRES_PASSWORD: chouette
+      POSTGRES_DB: chouette2
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chouette -d chouette2"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.bench
+    container_name: chouette-bench-app
+    environment:
+      RAILS_ENV: development
+      RAILS_DB_ADAPTER: postgis
+      RAILS_DB_HOST: db
+      RAILS_DB_USER: chouette
+      RAILS_DB_PASSWORD: chouette
+      RAILS_DB_NAME: chouette2
+      DISABLE_SPRING: "1"
+    volumes:
+      - ../chouette-core:/app
+      - bundle:/usr/local/bundle
+      - ./feed:/feed:ro
+      - ./out:/out
+      - ./runner:/bench
+    depends_on:
+      db:
+        condition: service_healthy
+    command: sleep infinity
+
+volumes:
+  pgdata:
+  bundle:
