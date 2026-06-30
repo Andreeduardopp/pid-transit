@@ -62,6 +62,7 @@ def validate_transmodel(db: TransmodelDatabase) -> ValidationReport:
     stop_ids: Set[str] = {s["id"] for s in stops}
     day_type_ids: Set[str] = {dt["id"] for dt in day_types}
     journey_ids: Set[str] = {sj["id"] for sj in journeys}
+    jp_ids: Set[str] = {p["id"] for p in patterns}
     jp_line_ids: Set[str] = {p["line_id"] for p in patterns}
     sj_line_ids: Set[str] = {sj["line_id"] for sj in journeys}
 
@@ -246,6 +247,17 @@ def validate_transmodel(db: TransmodelDatabase) -> ValidationReport:
                 entity_id=f"{fr['service_journey_id']}@{fr['start_time']}",
                 issue_type="orphan_journey_reference",
                 message=f"Frequency references non-existent ServiceJourney {fr['service_journey_id']}.",
+            ))
+
+    # --- V15: ServiceJourney journey_pattern_id references existing JourneyPattern ---
+    for sj in journeys:
+        jp_id = sj.get("journey_pattern_id")
+        if jp_id and jp_id not in jp_ids:
+            report._append(ValidationIssue(
+                entity_type="service_journey",
+                entity_id=sj["id"],
+                issue_type="orphan_pattern_reference",
+                message=f"ServiceJourney {sj['id']} references non-existent JourneyPattern {jp_id}.",
             ))
 
     return report
