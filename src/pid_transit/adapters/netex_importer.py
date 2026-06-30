@@ -179,6 +179,20 @@ class NetexImporter:
     def _import_journey_patterns(self, root: ET.Element, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
         patterns = []
         points = []
+
+        # Resolve patterns that lack their own RouteRef via the service journeys
+        # that reference them. Build the JourneyPatternRef -> LineRef map in a
+        # single pass instead of rescanning every ServiceJourney per pattern
+        # (which was an O(JP x SJ) full-tree scan).
+        jp_to_line: Dict[str, str] = {}
+        for sj in root.findall(".//n:ServiceJourney", self._ns):
+            jp_ref = sj.find("n:JourneyPatternRef", self._ns)
+            lr = sj.find("n:LineRef", self._ns)
+            if jp_ref is not None and lr is not None:
+                ref = jp_ref.attrib.get("ref")
+                if ref and ref not in jp_to_line:
+                    jp_to_line[ref] = lr.attrib.get("ref")
+
         for jp in root.findall(".//n:JourneyPattern", self._ns):
             jpid = jp.attrib.get("id")
             if not jpid:
@@ -190,13 +204,7 @@ class NetexImporter:
                 line_id = line_ref.attrib.get("ref")
 
             if not line_id:
-                for sj in root.findall(".//n:ServiceJourney", self._ns):
-                    jp_ref = sj.find("n:JourneyPatternRef", self._ns)
-                    if jp_ref is not None and jp_ref.attrib.get("ref") == jpid:
-                        lr = sj.find("n:LineRef", self._ns)
-                        if lr is not None:
-                            line_id = lr.attrib.get("ref")
-                            break
+                line_id = jp_to_line.get(jpid)
 
             if not line_id:
                 logger.warning("JourneyPattern %s has no line reference, skipping", jpid)
@@ -229,6 +237,26 @@ class NetexImporter:
     def _import_service_journeys(self, root: ET.Element, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
         journeys = []
         passing_times = []
+
+        # Pre-index each JourneyPattern's StopPointInJourneyPattern -> stop map
+        # once. Previously this map was rebuilt by rescanning the whole XML tree
+        # for every service journey, which is O(SJ x JP) and made round-trip
+        # import of a large feed take many minutes.
+        jp_spi_to_stop: Dict[str, Dict[str, str]] = {}
+        for jp in root.findall(".//n:JourneyPattern", self._ns):
+            jpid = jp.attrib.get("id")
+            if not jpid:
+                continue
+            seq = jp.find("n:pointsInSequence", self._ns)
+            if seq is None:
+                continue
+            mapping: Dict[str, str] = {}
+            for spi in seq.findall("n:StopPointInJourneyPattern", self._ns):
+                spi_id = spi.attrib.get("id")
+                ssp_ref = spi.find("n:ScheduledStopPointRef", self._ns)
+                if spi_id and ssp_ref is not None:
+                    mapping[spi_id] = ssp_ref.attrib.get("ref")
+            jp_spi_to_stop[jpid] = mapping
 
         for sj in root.findall(".//n:ServiceJourney", self._ns):
             sjid = sj.attrib.get("id")
@@ -263,18 +291,7 @@ class NetexImporter:
 
             pt_container = sj.find("n:passingTimes", self._ns)
             if pt_container is not None:
-                spi_to_stop = {}
-                if jp_id:
-                    for jp in root.findall(".//n:JourneyPattern", self._ns):
-                        if jp.attrib.get("id") == jp_id:
-                            seq = jp.find("n:pointsInSequence", self._ns)
-                            if seq is not None:
-                                for spi in seq.findall("n:StopPointInJourneyPattern", self._ns):
-                                    spi_id = spi.attrib.get("id")
-                                    ssp_ref = spi.find("n:ScheduledStopPointRef", self._ns)
-                                    if spi_id and ssp_ref is not None:
-                                        spi_to_stop[spi_id] = ssp_ref.attrib.get("ref")
-                            break
+                spi_to_stop = jp_spi_to_stop.get(jp_id, {}) if jp_id else {}
 
                 order = 0
                 for tpt in pt_container.findall("n:TimetabledPassingTime", self._ns):

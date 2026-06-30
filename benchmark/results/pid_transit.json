@@ -1,0 +1,186 @@
+{
+  "environment": {
+    "timestamp": "2026-06-29 11:00:08",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 197 Stepping 2, GenuineIntel",
+    "python": "3.12.1",
+    "logical_cpus": 16,
+    "physical_cpus": 16,
+    "total_ram_gb": 31.5
+  },
+  "config": {
+    "reps": 7,
+    "warmup": 1,
+    "feed": "C:\\Users\\eduar\\Documents\\gtfs-tool\\PID-GTFS\\gtfs_feed (1).zip"
+  },
+  "results": [
+    {
+      "name": "gtfs_import",
+      "description": "GTFS .zip -> Transmodel SQLite DB",
+      "reps": 7,
+      "wall_mean_s": 12.413917671390143,
+      "wall_std_s": 4.345417154162415,
+      "wall_min_s": 8.665139100048691,
+      "wall_max_s": 17.94501949986443,
+      "peak_rss_mean_mb": 402.99386160714283,
+      "peak_rss_max_mb": 403.25390625,
+      "artifact_mb": 84.65234375,
+      "raw": [
+        {
+          "wall_s": 9.0864,
+          "peak_rss_mb": 403.3
+        },
+        {
+          "wall_s": 9.2979,
+          "peak_rss_mb": 403.2
+        },
+        {
+          "wall_s": 8.6651,
+          "peak_rss_mb": 403.0
+        },
+        {
+          "wall_s": 8.8592,
+          "peak_rss_mb": 402.9
+        },
+        {
+          "wall_s": 15.6616,
+          "peak_rss_mb": 402.5
+        },
+        {
+          "wall_s": 17.945,
+          "peak_rss_mb": 403.1
+        },
+        {
+          "wall_s": 17.3822,
+          "peak_rss_mb": 403.0
+        }
+      ]
+    },
+    {
+      "name": "netex_export",
+      "description": "Transmodel DB -> NeTEx XML (dedup on)",
+      "reps": 7,
+      "wall_mean_s": 53.94106932859203,
+      "wall_std_s": 2.40055731321288,
+      "wall_min_s": 51.86586740007624,
+      "wall_max_s": 58.23639350011945,
+      "peak_rss_mean_mb": 2871.4324776785716,
+      "peak_rss_max_mb": 2872.328125,
+      "artifact_mb": 145.88889026641846,
+      "raw": [
+        {
+          "wall_s": 53.1316,
+          "peak_rss_mb": 2872.3
+        },
+        {
+          "wall_s": 58.2364,
+          "peak_rss_mb": 2871.3
+        },
+        {
+          "wall_s": 54.1777,
+          "peak_rss_mb": 2870.9
+        },
+        {
+          "wall_s": 55.993,
+          "peak_rss_mb": 2871.1
+        },
+        {
+          "wall_s": 51.8659,
+          "peak_rss_mb": 2871.9
+        },
+        {
+          "wall_s": 52.2597,
+          "peak_rss_mb": 2871.9
+        },
+        {
+          "wall_s": 51.9233,
+          "peak_rss_mb": 2870.6
+        }
+      ]
+    },
+    {
+      "name": "gtfs_export",
+      "description": "Transmodel DB -> GTFS .zip",
+      "reps": 7,
+      "wall_mean_s": 3.9732646999348487,
+      "wall_std_s": 0.15567234113263195,
+      "wall_min_s": 3.787965999916196,
+      "wall_max_s": 4.199119299883023,
+      "peak_rss_mean_mb": 425.4614955357143,
+      "peak_rss_max_mb": 426.76953125,
+      "artifact_mb": 4.603072166442871,
+      "raw": [
+        {
+          "wall_s": 4.0307,
+          "peak_rss_mb": 425.2
+        },
+        {
+          "wall_s": 4.1991,
+          "peak_rss_mb": 424.7
+        },
+        {
+          "wall_s": 3.9671,
+          "peak_rss_mb": 425.0
+        },
+        {
+          "wall_s": 4.1307,
+          "peak_rss_mb": 425.8
+        },
+        {
+          "wall_s": 3.8277,
+          "peak_rss_mb": 426.8
+        },
+        {
+          "wall_s": 3.8696,
+          "peak_rss_mb": 425.6
+        },
+        {
+          "wall_s": 3.788,
+          "peak_rss_mb": 425.1
+        }
+      ]
+    },
+    {
+      "name": "netex_import",
+      "description": "NeTEx XML -> Transmodel SQLite DB (round-trip)",
+      "reps": 7,
+      "wall_mean_s": 13.329076071402856,
+      "wall_std_s": 0.33125154104115273,
+      "wall_min_s": 12.803424200043082,
+      "wall_max_s": 13.657511299941689,
+      "peak_rss_mean_mb": 1039.779575892857,
+      "peak_rss_max_mb": 1039.99609375,
+      "artifact_mb": 42.66796875,
+      "raw": [
+        {
+          "wall_s": 13.6547,
+          "peak_rss_mb": 1039.7
+        },
+        {
+          "wall_s": 13.6575,
+          "peak_rss_mb": 1039.7
+        },
+        {
+          "wall_s": 13.616,
+          "peak_rss_mb": 1040.0
+        },
+        {
+          "wall_s": 13.1177,
+          "peak_rss_mb": 1039.8
+        },
+        {
+          "wall_s": 13.328,
+          "peak_rss_mb": 1039.8
+        },
+        {
+          "wall_s": 13.1262,
+          "peak_rss_mb": 1039.7
+        },
+        {
+          "wall_s": 12.8034,
+          "peak_rss_mb": 1039.8
+        }
+      ]
+    }
+  ]
+}

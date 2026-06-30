@@ -1,0 +1,42 @@
+{
+  "environment": {
+    "timestamp": "2026-06-30 02:17:20",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 197 Stepping 2, GenuineIntel",
+    "python": "3.12.1",
+    "logical_cpus": 16,
+    "physical_cpus": 16,
+    "total_ram_gb": 31.5
+  },
+  "config": {
+    "reps": 7,
+    "warmup": 1
+  },
+  "results": {
+    "theoremus_netex_to_gtfs": {
+      "wall_mean_s": 11.984051142852488,
+      "wall_std_s": 3.624987288294033,
+      "wall_min_s": 7.6266636999789625,
+      "wall_max_s": 16.763621600111946,
+      "peak_rss_mean_mb": 530.3588169642857,
+      "peak_rss_max_mb": 532.14453125
+    },
+    "pid_netex_import": {
+      "wall_mean_s": 14.604096957149782,
+      "wall_std_s": 0.30416811106686215,
+      "wall_min_s": 14.08262150012888,
+      "wall_max_s": 15.059991099871695,
+      "peak_rss_mean_mb": 1045.623325892857,
+      "peak_rss_max_mb": 1045.75390625
+    },
+    "pid_gtfs_export": {
+      "wall_mean_s": 3.9231025000501956,
+      "wall_std_s": 0.04647046839979866,
+      "wall_min_s": 3.8667012001387775,
+      "wall_max_s": 3.9995681999716908,
+      "peak_rss_mean_mb": 422.7220982142857,
+      "peak_rss_max_mb": 423.7890625
+    }
+  },
+  "pid_netex_to_gtfs_total_s": 18.527199457199977
+}

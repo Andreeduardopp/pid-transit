@@ -4,7 +4,6 @@ NeTEx Exporter Adapter (Object-Oriented).
 
 import logging
 import xml.etree.ElementTree as ET
-from xml.dom import minidom
 from datetime import datetime, timezone
 from typing import Union
 from pathlib import Path
@@ -113,17 +112,23 @@ class NetexExporter:
         self._write_service_calendar_frame(db, frames)
         self._write_timetable_frame(db, frames)
 
-        raw = ET.tostring(root, encoding="utf-8")
-        pretty = minidom.parseString(raw).toprettyxml(indent="  ")
+        # Pretty-print in place and stream straight to the file. Previously this
+        # round-tripped the whole document through minidom
+        # (ET.tostring -> minidom.parseString -> toprettyxml), which held the
+        # ElementTree, a serialized byte string, a second far-heavier minidom DOM
+        # and the final pretty string in memory simultaneously -- the dominant
+        # cost in NeTEx export peak RSS. ET.indent + ElementTree.write keeps only
+        # the ElementTree and serializes incrementally to the open file.
+        ET.indent(root, space="  ")
+        tree = ET.ElementTree(root)
 
         out_path = Path(output_path)
         if self.compress:
             import gzip
-            with gzip.open(str(out_path) + ".gz", "wt", encoding="utf-8") as f:
-                f.write(pretty)
+            with gzip.open(str(out_path) + ".gz", "wb") as f:
+                tree.write(f, encoding="utf-8", xml_declaration=True)
         else:
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(pretty)
+            tree.write(str(out_path), encoding="utf-8", xml_declaration=True)
 
     # -------------------------------------------------------------------------
     # ResourceFrame — operators
@@ -169,6 +174,23 @@ class NetexExporter:
             ET.SubElement(location, "Latitude").text = str(sp["lat"])
             ET.SubElement(el, "StopPlaceType").text = "onstreetBus"
 
+        # Emit Quays as direct children of the SiteFrame (siblings of stopPlaces),
+        # not nested inside StopPlace. European-profile converters resolve a passing
+        # time to a physical stop via ScheduledStopPoint.QuayRef -> Quay; a Quay only
+        # registers when it appears as a top-level element (a Quay nested inside a
+        # StopPlace is consumed with the StopPlace and never indexed). EPIP-faithful
+        # tools (incl. our own importer) read StopPlace and ignore these. Additive.
+        quays_el = ET.SubElement(frame, "quays")
+        for sp in stops:
+            quay = ET.SubElement(quays_el, "Quay", attrib={
+                "id": f"{sp['id']}:Quay", "version": "1"
+            })
+            ET.SubElement(quay, "Name").text = sp["name"]
+            q_centroid = ET.SubElement(quay, "Centroid")
+            q_location = ET.SubElement(q_centroid, "Location")
+            ET.SubElement(q_location, "Longitude").text = str(sp["lon"])
+            ET.SubElement(q_location, "Latitude").text = str(sp["lat"])
+
     # -------------------------------------------------------------------------
     # ServiceFrame — lines, scheduled stop points, journey patterns
     # -------------------------------------------------------------------------
@@ -205,7 +227,11 @@ class NetexExporter:
             ssps_el = ET.SubElement(frame, "scheduledStopPoints")
             for sp in stops:
                 el = ET.SubElement(ssps_el, "ScheduledStopPoint", attrib={
-                    "id": sp["id"], "version": "1"
+                    "id": sp["id"], "version": "1",
+                    # Link to the Quay nested in the SiteFrame. European-profile
+                    # converters use this attribute to resolve a passing time to a
+                    # physical stop; our importer ignores it (round-trip-safe).
+                    "QuayRef": f"{sp['id']}:Quay",
                 })
                 ET.SubElement(el, "Name").text = sp["name"]
 

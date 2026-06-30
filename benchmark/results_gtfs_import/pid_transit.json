@@ -1,0 +1,72 @@
+{
+  "environment": {
+    "timestamp": "2026-06-29 11:13:39",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 197 Stepping 2, GenuineIntel",
+    "python": "3.12.1",
+    "logical_cpus": 16,
+    "physical_cpus": 16,
+    "total_ram_gb": 31.5
+  },
+  "config": {
+    "reps": 10,
+    "warmup": 2,
+    "feed": "C:\\Users\\eduar\\Documents\\gtfs-tool\\PID-GTFS\\gtfs_feed (1).zip"
+  },
+  "results": [
+    {
+      "name": "gtfs_import",
+      "description": "GTFS .zip -> Transmodel SQLite DB",
+      "reps": 10,
+      "wall_mean_s": 9.051450339984148,
+      "wall_std_s": 0.1281660688588343,
+      "wall_min_s": 8.912488400004804,
+      "wall_max_s": 9.315936299972236,
+      "peak_rss_mean_mb": 402.79296875,
+      "peak_rss_max_mb": 403.140625,
+      "artifact_mb": 84.65234375,
+      "raw": [
+        {
+          "wall_s": 8.979,
+          "peak_rss_mb": 402.6
+        },
+        {
+          "wall_s": 8.9157,
+          "peak_rss_mb": 402.7
+        },
+        {
+          "wall_s": 9.1533,
+          "peak_rss_mb": 402.9
+        },
+        {
+          "wall_s": 9.3159,
+          "peak_rss_mb": 403.1
+        },
+        {
+          "wall_s": 8.9125,
+          "peak_rss_mb": 402.7
+        },
+        {
+          "wall_s": 8.9629,
+          "peak_rss_mb": 402.9
+        },
+        {
+          "wall_s": 9.051,
+          "peak_rss_mb": 402.7
+        },
+        {
+          "wall_s": 8.9775,
+          "peak_rss_mb": 402.9
+        },
+        {
+          "wall_s": 9.144,
+          "peak_rss_mb": 402.7
+        },
+        {
+          "wall_s": 9.1028,
+          "peak_rss_mb": 402.6
+        }
+      ]
+    }
+  ]
+}

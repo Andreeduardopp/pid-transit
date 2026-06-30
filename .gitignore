@@ -6,7 +6,7 @@ __pycache__/
 *.so
 
 # Data / generated files
-*.zip
+# *.zip
 *.db
 *.sqlite
 *.sqlite3

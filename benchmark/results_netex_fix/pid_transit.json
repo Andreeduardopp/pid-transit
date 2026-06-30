@@ -1,0 +1,52 @@
+{
+  "environment": {
+    "timestamp": "2026-06-29 16:56:50",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 197 Stepping 2, GenuineIntel",
+    "python": "3.12.1",
+    "logical_cpus": 16,
+    "physical_cpus": 16,
+    "total_ram_gb": 31.5
+  },
+  "config": {
+    "reps": 5,
+    "warmup": 1,
+    "feed": "C:\\Users\\eduar\\Documents\\gtfs-tool\\PID-GTFS\\gtfs_feed (1).zip"
+  },
+  "results": [
+    {
+      "name": "netex_export",
+      "description": "Transmodel DB -> NeTEx XML (dedup on)",
+      "reps": 5,
+      "wall_mean_s": 18.341507780039684,
+      "wall_std_s": 0.35659208944762366,
+      "wall_min_s": 18.00847649993375,
+      "wall_max_s": 18.902071800082922,
+      "peak_rss_mean_mb": 769.8703125,
+      "peak_rss_max_mb": 770.140625,
+      "artifact_mb": 146.37238025665283,
+      "raw": [
+        {
+          "wall_s": 18.0085,
+          "peak_rss_mb": 769.9
+        },
+        {
+          "wall_s": 18.057,
+          "peak_rss_mb": 769.8
+        },
+        {
+          "wall_s": 18.3489,
+          "peak_rss_mb": 770.1
+        },
+        {
+          "wall_s": 18.3911,
+          "peak_rss_mb": 769.7
+        },
+        {
+          "wall_s": 18.9021,
+          "peak_rss_mb": 769.9
+        }
+      ]
+    }
+  ]
+}
