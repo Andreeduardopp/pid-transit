@@ -141,7 +141,7 @@ print(stats)
 #  'shape_point': 45000, 'transfer': 120, ...}
 ```
 
-### Importing a NeTEx File
+### Importing NeTEx Data
 
 ```python
 from pid_transit import TransitDataset, NetexImporter
@@ -149,10 +149,30 @@ from pid_transit import TransitDataset, NetexImporter
 dataset = TransitDataset("my_city.db")
 importer = NetexImporter(fallback_timezone="Europe/Lisbon")
 
-stats = dataset.import_data(importer, "path/to/netex.xml")
+stats = dataset.import_data(importer, "path/to/netex.xml")   # single file
+stats = dataset.import_data(importer, "path/to/netex_dir/")  # directory of .xml
+stats = dataset.import_data(importer, "path/to/dataset.zip") # zip (streamed)
+stats = dataset.import_data(importer, ["a.xml", "b.xml"])    # explicit list
 ```
 
-The NeTEx importer parses all standard frames: `ResourceFrame` (operators), `SiteFrame` (stops), `ServiceCalendarFrame` (day types), `ServiceFrame` (lines, journey patterns), and `TimetableFrame` (service journeys, passing times). It correctly handles `DayOffset` elements for overnight services (times >= 24:00:00).
+The NeTEx importer parses all standard frames: `ResourceFrame` (operators), `SiteFrame` (stops, quays, accessibility), `ServiceCalendarFrame` (day types, validity, day-type assignments, operating periods, availability conditions), `ServiceFrame` (lines, routes, journey patterns, stop assignments, connections/transfers, shape projections), and `TimetableFrame` (service journeys, template journeys with frequencies, passing times or calls). It correctly handles `DayOffset` elements for overnight services (times >= 24:00:00).
+
+Multi-file datasets are imported in two streaming passes (reference data first, then service journeys), so entities may reference each other across files in any order and peak memory stays flat regardless of feed size. Stop coordinates resolve through `PassengerStopAssignment` → `Quay`/`StopPlace`, matching production feeds such as the Swiss national timetable.
+
+For long-running conversions the importers accept a progress callback and a cancel event (both optional, also on `GtfsImporter`):
+
+```python
+import threading
+
+cancel = threading.Event()
+
+def on_progress(entity_type, count, *, file_index=None, total_files=None):
+    print(f"{entity_type}: {count:,} (file {file_index}/{total_files})")
+
+importer = NetexImporter(on_progress=on_progress, cancel_event=cancel)
+# cancel.set() from another thread aborts between batches
+# with pid_transit.core.exceptions.ImportCancelledError
+```
 
 ### Exporting to GTFS
 
@@ -183,6 +203,8 @@ dataset.export_data(exporter, "output_netex.xml")
 ```
 
 The `deduplicate_patterns` option groups journey patterns with identical stop sequences (same line, direction, and ordered stops), writing only canonical patterns and remapping references. This can reduce NeTEx output from thousands of duplicate patterns to a few hundred unique ones.
+
+The export includes calendar validity (`ValidBetween`) and exceptions (`DayTypeAssignment`), shapes (`LinkSequenceProjection` with `gml:posList` on the journey pattern), transfers (`Connection`), frequencies (`TemplateServiceJourney`/`HeadwayJourneyGroup`), and wheelchair accessibility (`AccessibilityAssessment`) — all of which the NeTEx importer reads back, so GTFS → NeTEx → GTFS round-trips are lossless for these fields (`bikes_allowed` is GTFS-only).
 
 ### Importing from CSV or Excel
 
@@ -468,7 +490,7 @@ for route in my_api.get_routes():
     ))
 ```
 
-For full importer adapters, implement `import_to_db(db, source)` returning a `dict[str, int]` of record counts. For exporters, implement `export_from_db(db, target)`.
+For full importer adapters, implement `import_to_db(db, source)` returning a `dict[str, int]` of record counts. For exporters, implement `export_from_db(db, target)`. Adapter conveniences worth reusing: wrap the import in `db.bulk_session()` (one pinned connection + bulk pragmas), pass `validate=False` to `db.upsert()` for rows your adapter built itself, and expose `on_progress`/`cancel_event` constructor arguments like the built-in importers do.
 
 ## Testing
 
@@ -477,7 +499,7 @@ pip install pid-transit[dev]
 pytest
 ```
 
-The test suite includes 115 tests covering all modules: database CRUD, schema validation, GTFS/NeTEx import/export round-trips, repository operations, statistics, feed diff, multi-feed merge, GTFS-RT readiness, and CLI commands.
+The test suite includes 152 tests covering all modules: database CRUD, schema validation, GTFS/NeTEx import/export round-trips, repository operations, statistics, feed diff, multi-feed merge, GTFS-RT readiness, and CLI commands.
 
 ## License
 

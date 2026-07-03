@@ -50,8 +50,8 @@ class ScheduledStopPoint(BaseModel):
     """Corresponds to Transmodel 'ScheduledStopPoint' / GTFS 'stop' (location_type=0)."""
     id: str = Field(..., description="Unique stop point identifier")
     name: str = Field(..., description="Public name of the stop")
-    lat: float = Field(..., ge=-90, le=90, description="Latitude")
-    lon: float = Field(..., ge=-180, le=180, description="Longitude")
+    lat: Optional[float] = Field(None, ge=-90, le=90, description="Latitude (None if unknown)")
+    lon: Optional[float] = Field(None, ge=-180, le=180, description="Longitude (None if unknown)")
     stop_area_id: Optional[str] = Field(None, description="Reference to a parent StopPlace/StopArea")
     wheelchair_boarding: Optional[int] = Field(None, description="0=no info, 1=yes, 2=no")
 

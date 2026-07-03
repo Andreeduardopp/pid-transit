@@ -30,6 +30,40 @@ class TestConstruction:
         assert db2.count("operator") == 1
 
 
+class TestSchemaMigration:
+    def test_v30_stop_coords_become_nullable(self, tmp_path):
+        import sqlite3
+        path = tmp_path / "old.db"
+        conn = sqlite3.connect(path)
+        conn.execute("""
+            CREATE TABLE scheduled_stop_point (
+                id                  TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                lat                 REAL NOT NULL,
+                lon                 REAL NOT NULL,
+                stop_area_id        TEXT,
+                wheelchair_boarding INTEGER
+            )
+        """)
+        conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "INSERT INTO _meta VALUES ('schema_version', '3.0.0-transmodel')"
+        )
+        conn.execute(
+            "INSERT INTO scheduled_stop_point VALUES ('S1', 'Old', 1.0, 2.0, NULL, NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        db = TransmodelDatabase(path)
+        # existing row survives the rebuild
+        assert db.get_one("scheduled_stop_point", where={"id": "S1"})["lat"] == 1.0
+        # NULL coordinates are now accepted
+        db.upsert("scheduled_stop_point", [{"id": "S2", "name": "No coords"}])
+        row = db.get_one("scheduled_stop_point", where={"id": "S2"})
+        assert row["lat"] is None
+
+
 class TestUpsert:
     def test_insert(self, db, sample_operator):
         n = db.upsert("operator", [sample_operator])
@@ -55,6 +89,85 @@ class TestUpsert:
         n = db.upsert("scheduled_stop_point", sample_stops)
         assert n == 2
         assert db.count("scheduled_stop_point") == 2
+
+    def test_empty_records(self, db):
+        assert db.upsert("operator", []) == 0
+
+    def test_unvalidated_matches_validated(self, db, sample_operator):
+        db.upsert("operator", [sample_operator], validate=True)
+        validated = db.get_records("operator")
+        db.delete("operator", where={"id": sample_operator["id"]})
+        db.upsert("operator", [sample_operator], validate=False)
+        assert db.get_records("operator") == validated
+
+    def test_unvalidated_applies_model_defaults(self, db):
+        db.upsert("fare_attribute", [{
+            "id": "F1", "price": 1.0, "currency_type": "EUR", "payment_method": 0,
+        }])
+        # fare_rule has defaulted columns the raw dict omits
+        db.upsert("fare_rule", [{"fare_id": "F1"}], validate=False)
+        row = db.get_records("fare_rule")[0]
+        assert row["route_id"] == ""
+        assert row["origin_id"] == ""
+
+    def test_unvalidated_missing_required_hits_db_constraint(self, db):
+        import sqlite3
+        with pytest.raises(sqlite3.IntegrityError):
+            db.upsert("operator", [{"id": "X"}], validate=False)
+
+
+class TestBulkSession:
+    def test_commits_on_exit(self, tmp_path, sample_operator):
+        path = tmp_path / "test.db"
+        db = TransmodelDatabase(path)
+        with db.bulk_session():
+            db.upsert("operator", [sample_operator])
+        db2 = TransmodelDatabase(path)
+        assert db2.count("operator") == 1
+
+    def test_reuses_one_connection(self, tmp_path):
+        db = TransmodelDatabase(tmp_path / "test.db")
+        with db.bulk_session() as conn:
+            assert db.connect() is conn
+            assert db.connect() is conn
+        assert db.connect() is not conn
+
+    def test_bulk_pragmas_on_file_db(self, tmp_path):
+        db = TransmodelDatabase(tmp_path / "test.db")
+        with db.bulk_session() as conn:
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+
+    def test_rolls_back_uncommitted_on_error(self, tmp_path, sample_operator):
+        path = tmp_path / "test.db"
+        db = TransmodelDatabase(path)
+        with pytest.raises(RuntimeError):
+            with db.bulk_session() as conn:
+                conn.execute(
+                    "INSERT INTO operator (id, name, timezone) VALUES ('X', 'Y', 'UTC')"
+                )
+                raise RuntimeError("boom")
+        assert TransmodelDatabase(path).count("operator") == 0
+
+    def test_in_memory_passthrough(self, db, sample_operator):
+        with db.bulk_session():
+            db.upsert("operator", [sample_operator])
+        assert db.count("operator") == 1
+
+    def test_nested_sessions_share_connection(self, tmp_path):
+        db = TransmodelDatabase(tmp_path / "test.db")
+        with db.bulk_session() as outer:
+            with db.bulk_session() as inner:
+                assert inner is outer
+            # inner exit must not release the outer session
+            assert db.connect() is outer
+
+    def test_reads_work_inside_session(self, tmp_path, sample_operator):
+        db = TransmodelDatabase(tmp_path / "test.db")
+        with db.bulk_session():
+            db.upsert("operator", [sample_operator])
+            assert db.count("operator") == 1
+            assert db.get_records("operator")[0]["id"] == sample_operator["id"]
 
 
 class TestGetRecords:

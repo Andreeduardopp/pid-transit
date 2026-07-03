@@ -58,7 +58,7 @@ class GtfsExporter:
                 agencies.append({
                     "agency_id": op["id"],
                     "agency_name": op["name"],
-                    "agency_url": op["url"] or "http://unknown.url",
+                    "agency_url": op["url"] or "https://example.com",
                     "agency_timezone": op["timezone"],
                     "agency_lang": _v(op.get("lang")),
                     "agency_phone": _v(op.get("phone")),
@@ -98,8 +98,8 @@ class GtfsExporter:
                 stops.append({
                     "stop_id": sp["id"],
                     "stop_name": sp["name"],
-                    "stop_lat": sp["lat"],
-                    "stop_lon": sp["lon"],
+                    "stop_lat": _v(sp.get("lat")),
+                    "stop_lon": _v(sp.get("lon")),
                     "location_type": 0,
                     "parent_station": _v(sp.get("stop_area_id")),
                     "wheelchair_boarding": _v(sp.get("wheelchair_boarding")),
@@ -185,10 +185,15 @@ class GtfsExporter:
             passing_times = db.get_records("passing_time")
             stop_times = []
             for pt in passing_times:
+                # GTFS wants both times whenever either is set (trip edges must
+                # be fully timed); NeTEx calls often carry only a departure at
+                # the first stop and only an arrival at the last.
+                arr = pt.get("arrival_time") or pt.get("departure_time")
+                dep = pt.get("departure_time") or pt.get("arrival_time")
                 stop_times.append({
                     "trip_id": pt["service_journey_id"],
-                    "arrival_time": _v(pt.get("arrival_time")),
-                    "departure_time": _v(pt.get("departure_time")),
+                    "arrival_time": _v(arr),
+                    "departure_time": _v(dep),
                     "stop_id": pt["stop_point_id"],
                     "stop_sequence": pt["order"],
                 })

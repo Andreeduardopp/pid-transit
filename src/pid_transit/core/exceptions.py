@@ -10,6 +10,10 @@ class ImportFailedError(TransitError):
     """Raised when an adapter fails to parse or import a transit feed."""
     pass
 
+class ImportCancelledError(TransitError):
+    """Raised when an import is aborted via a cancel event."""
+    pass
+
 class ExportFailedError(TransitError):
     """Raised when an adapter fails to export data to a target format."""
     pass

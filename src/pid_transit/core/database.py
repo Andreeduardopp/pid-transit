@@ -7,7 +7,8 @@ with full referential integrity.
 
 import sqlite3
 import logging
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -15,7 +16,7 @@ from .schemas import TRANSMODEL_ENTITIES
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "3.0.0-transmodel"
+SCHEMA_VERSION = "3.1.0-transmodel"
 
 _TABLE_SCHEMAS = {
     "operator": """
@@ -42,8 +43,8 @@ _TABLE_SCHEMAS = {
         CREATE TABLE IF NOT EXISTS scheduled_stop_point (
             id                  TEXT PRIMARY KEY,
             name                TEXT NOT NULL,
-            lat                 REAL NOT NULL,
-            lon                 REAL NOT NULL,
+            lat                 REAL,
+            lon                 REAL,
             stop_area_id        TEXT,
             wheelchair_boarding INTEGER
         )
@@ -242,6 +243,7 @@ class TransmodelDatabase:
 
     def __init__(self, db_path: Path | str):
         self._in_memory = str(db_path) == ":memory:"
+        self._session_conn: Optional[sqlite3.Connection] = None
         if self._in_memory:
             # Keep one persistent connection so the in-memory database survives
             # across multiple method calls (each new connection to ":memory:"
@@ -259,10 +261,57 @@ class TransmodelDatabase:
     def connect(self) -> sqlite3.Connection:
         if self._in_memory:
             return self._conn
+        if self._session_conn is not None:
+            return self._session_conn
         conn = sqlite3.connect(str(self.db_path))
         conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _release(self, conn: sqlite3.Connection) -> None:
+        """Close a connection obtained from connect(), unless it is shared
+        (the in-memory connection or an active bulk session)."""
+        if not self._in_memory and conn is not self._session_conn:
+            conn.close()
+
+    @contextmanager
+    def bulk_session(self) -> Iterator[sqlite3.Connection]:
+        """Pin one connection for the duration of a bulk import/export run.
+
+        While active, connect() hands out this connection instead of opening
+        a fresh one per call. File-backed databases get bulk-load pragmas
+        (WAL journal, relaxed fsync) and the _meta.last_modified stamp is
+        written once at session end instead of per upsert. Nested sessions
+        reuse the outer connection. On exception the transaction is rolled
+        back before the connection is released.
+        """
+        if self._session_conn is not None or self._in_memory:
+            # Nested session, or in-memory (already a single shared conn).
+            yield self.connect()
+            return
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.row_factory = sqlite3.Row
+        self._session_conn = conn
+        try:
+            yield conn
+            self._touch_last_modified(conn)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            self._session_conn = None
+            conn.close()
+
+    def _touch_last_modified(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+            ("last_modified", datetime.now(timezone.utc).isoformat()),
+        )
 
     def _ensure_schema(self) -> None:
         conn = self.connect()
@@ -302,6 +351,8 @@ class TransmodelDatabase:
                     "Migrating schema from %s to %s",
                     stored_version or "unknown", SCHEMA_VERSION,
                 )
+                if stored_version == "3.0.0-transmodel":
+                    self._migrate_nullable_stop_coords(conn)
                 for ddl in _TABLE_SCHEMAS.values():
                     conn.execute(ddl)
                 conn.execute(
@@ -313,38 +364,77 @@ class TransmodelDatabase:
             if close_after:
                 conn.close()
 
+    @staticmethod
+    def _migrate_nullable_stop_coords(conn: sqlite3.Connection) -> None:
+        """3.0 -> 3.1: lat/lon on scheduled_stop_point became nullable.
+
+        SQLite cannot drop NOT NULL in place, so rebuild the table.
+        legacy_alter_table keeps the RENAME from rewriting the foreign keys
+        in referencing tables (passing_time etc.) to point at the temp name.
+        """
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("PRAGMA legacy_alter_table = ON")
+        try:
+            conn.execute("ALTER TABLE scheduled_stop_point RENAME TO _ssp_migrate_old")
+            conn.execute(_TABLE_SCHEMAS["scheduled_stop_point"])
+            conn.execute(
+                "INSERT INTO scheduled_stop_point "
+                "SELECT id, name, lat, lon, stop_area_id, wheelchair_boarding "
+                "FROM _ssp_migrate_old"
+            )
+            conn.execute("DROP TABLE _ssp_migrate_old")
+            conn.commit()
+        finally:
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            conn.execute("PRAGMA foreign_keys = ON")
+
     def _check_table(self, table_name: str) -> None:
         if table_name not in _TABLE_SCHEMAS:
             raise ValueError(f"Unknown table: {table_name}")
 
-    def upsert(self, table_name: str, records: List[Dict[str, Any]]) -> int:
-        """Upsert records into a Transmodel table."""
+    def upsert(self, table_name: str, records: List[Dict[str, Any]], validate: bool = True) -> int:
+        """Upsert records into a Transmodel table.
+
+        With validate=False the per-row Pydantic construction is skipped and
+        record dicts are bound directly (missing keys fall back to the model
+        defaults). Only use it for rows an adapter built itself and knows the
+        shape of; malformed values then surface as sqlite errors instead of
+        ValidationErrors.
+        """
         if table_name not in TRANSMODEL_ENTITIES:
             raise ValueError(f"Unknown table {table_name}")
+        if not records:
+            return 0
 
         model_cls = TRANSMODEL_ENTITIES[table_name]
+        fields = model_cls.model_fields
+        cols = list(fields)
+        safe_cols = [f'"{c}"' if c == "order" else c for c in cols]
+        placeholders = ",".join(["?"] * len(cols))
+        sql = f"INSERT OR REPLACE INTO {table_name} ({','.join(safe_cols)}) VALUES ({placeholders})"
+
+        if validate:
+            rows = [
+                tuple(row_dict[c] for c in cols)
+                for row_dict in (model_cls(**raw).model_dump() for raw in records)
+            ]
+        else:
+            defaults = {
+                name: None if f.is_required() else f.get_default(call_default_factory=True)
+                for name, f in fields.items()
+            }
+            rows = [tuple(raw.get(c, defaults[c]) for c in cols) for raw in records]
+
         conn = self.connect()
-        inserted = 0
         try:
-            for raw in records:
-                obj = model_cls(**raw)
-                row_dict = obj.model_dump()
-                cols = list(row_dict.keys())
-                placeholders = ",".join(["?"] * len(cols))
-                safe_cols = [f'"{c}"' if c == "order" else c for c in cols]
-                col_str = ",".join(safe_cols)
-                sql = f"INSERT OR REPLACE INTO {table_name} ({col_str}) VALUES ({placeholders})"
-                conn.execute(sql, [row_dict[c] for c in cols])
-                inserted += 1
-            conn.execute(
-                "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
-                ("last_modified", datetime.now(timezone.utc).isoformat()),
-            )
+            conn.executemany(sql, rows)
+            if self._session_conn is None:
+                # Inside a bulk session the stamp is written once at session end.
+                self._touch_last_modified(conn)
             conn.commit()
         finally:
-            if not self._in_memory:
-                conn.close()
-        return inserted
+            self._release(conn)
+        return len(records)
 
     def get_records(self, table_name: str) -> List[Dict[str, Any]]:
         """Fetch all records from a table."""
@@ -354,8 +444,7 @@ class TransmodelDatabase:
             cur = conn.execute(f"SELECT * FROM {table_name}")
             return [dict(row) for row in cur.fetchall()]
         finally:
-            if not self._in_memory:
-                conn.close()
+            self._release(conn)
 
     def query(
         self,
@@ -385,8 +474,7 @@ class TransmodelDatabase:
             cur = conn.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
         finally:
-            if not self._in_memory:
-                conn.close()
+            self._release(conn)
 
     def get_one(
         self, table_name: str, where: Dict[str, Any]
@@ -414,8 +502,7 @@ class TransmodelDatabase:
             cur = conn.execute(sql, params)
             return cur.fetchone()[0]
         finally:
-            if not self._in_memory:
-                conn.close()
+            self._release(conn)
 
     def delete(self, table_name: str, where: Dict[str, Any]) -> int:
         """Delete records matching the where clause. Returns count deleted."""
@@ -435,5 +522,4 @@ class TransmodelDatabase:
             conn.commit()
             return cur.rowcount
         finally:
-            if not self._in_memory:
-                conn.close()
+            self._release(conn)

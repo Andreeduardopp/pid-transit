@@ -10,9 +10,12 @@ from typing import Dict, Any, Union
 from pathlib import Path
 
 from ..core.database import TransmodelDatabase
+from ..core.exceptions import ImportCancelledError
 from ..core.schemas import TransportMode, DirectionType
 
 logger = logging.getLogger(__name__)
+
+BATCH_SIZE = 5000
 
 
 def _safe_float(val: str, field: str, row_id: str) -> Union[float, None]:
@@ -40,9 +43,36 @@ class GtfsImporter:
     Adapter class for importing GTFS .zip files into the Transmodel database.
     """
     
-    def __init__(self, strict_mode: bool = False, fallback_timezone: str = "UTC"):
+    def __init__(self, strict_mode: bool = False, fallback_timezone: str = "UTC",
+                 on_progress=None, cancel_event=None):
+        """
+        Args:
+            strict_mode: reserved for stricter validation behavior.
+            fallback_timezone: used when agency.txt has no timezone.
+            on_progress: optional callable
+                ``(entity_type: str, count: int, *, file_index=None, total_files=None)``
+                fired after every batch flush with the cumulative row count.
+            cancel_event: optional ``threading.Event``; when set, the import
+                aborts between batches with ``ImportCancelledError``.
+        """
         self.strict_mode = strict_mode
         self.fallback_timezone = fallback_timezone
+        self.on_progress = on_progress
+        self.cancel_event = cancel_event
+
+    def _check_cancel(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise ImportCancelledError("GTFS import cancelled")
+
+    def _flush_table(self, db: TransmodelDatabase, stats: Dict[str, int],
+                     table: str, rows: list) -> None:
+        """Upsert rows in batches, reporting cumulative progress per flush."""
+        for i in range(0, len(rows), BATCH_SIZE):
+            self._check_cancel()
+            n = db.upsert(table, rows[i:i + BATCH_SIZE])
+            stats[table] = stats.get(table, 0) + n
+            if self.on_progress is not None:
+                self.on_progress(table, stats[table], file_index=None, total_files=None)
 
     def _iter_csv_rows(self, zf: zipfile.ZipFile, filename: str):
         if filename not in zf.namelist():
@@ -83,7 +113,7 @@ class GtfsImporter:
         logger.info("Importing GTFS archive: %s", archive_path)
         stats = {}
         warnings = 0
-        with zipfile.ZipFile(archive_path) as zf:
+        with db.bulk_session(), zipfile.ZipFile(archive_path) as zf:
 
             # 1. Operators
             operators = []
@@ -97,7 +127,7 @@ class GtfsImporter:
                     "phone": row.get("agency_phone")
                 })
             if operators:
-                stats["operator"] = db.upsert("operator", operators)
+                self._flush_table(db, stats, "operator", operators)
                 logger.info("Imported %d operators", stats["operator"])
             else:
                 logger.warning("No agency.txt or no agencies found; operator references will be NULL")
@@ -117,7 +147,7 @@ class GtfsImporter:
                     "color": row.get("route_color")
                 })
             if lines:
-                stats["line"] = db.upsert("line", lines)
+                self._flush_table(db, stats, "line", lines)
                 logger.info("Imported %d lines", stats["line"])
 
             # 3. Levels
@@ -130,7 +160,7 @@ class GtfsImporter:
                     "name": row.get("level_name"),
                 })
             if levels:
-                stats["level"] = db.upsert("level", levels)
+                self._flush_table(db, stats, "level", levels)
                 logger.info("Imported %d levels", stats["level"])
 
             # 4. Stops (ScheduledStopPoints + StopAreas)
@@ -168,10 +198,10 @@ class GtfsImporter:
                         "wheelchair_boarding": wb_val,
                     })
             if stop_areas:
-                stats["stop_area"] = db.upsert("stop_area", stop_areas)
+                self._flush_table(db, stats, "stop_area", stop_areas)
                 logger.info("Imported %d stop areas", stats["stop_area"])
             if stops:
-                stats["scheduled_stop_point"] = db.upsert("scheduled_stop_point", stops)
+                self._flush_table(db, stats, "scheduled_stop_point", stops)
                 logger.info("Imported %d stops", stats["scheduled_stop_point"])
 
             # 5. Pathways
@@ -193,7 +223,7 @@ class GtfsImporter:
                     "reversed_signposted_as": row.get("reversed_signposted_as") or None,
                 })
             if pathways:
-                stats["pathway"] = db.upsert("pathway", pathways)
+                self._flush_table(db, stats, "pathway", pathways)
                 logger.info("Imported %d pathways", stats["pathway"])
 
             # 6. DayTypes
@@ -212,7 +242,7 @@ class GtfsImporter:
                     "end_date": row["end_date"]
                 })
             if day_types:
-                stats["day_type"] = db.upsert("day_type", day_types)
+                self._flush_table(db, stats, "day_type", day_types)
                 logger.info("Imported %d day types", stats["day_type"])
 
             # 7. OperatingDayExceptions
@@ -237,8 +267,8 @@ class GtfsImporter:
                         "sunday": False,
                         "start_date": min_date, "end_date": max_date,
                     } for sid in missing_ids]
-                    stats["day_type"] = stats.get("day_type", 0) + db.upsert("day_type", placeholder_day_types)
-                stats["operating_day_exception"] = db.upsert("operating_day_exception", exceptions)
+                    self._flush_table(db, stats, "day_type", placeholder_day_types)
+                self._flush_table(db, stats, "operating_day_exception", exceptions)
                 logger.info("Imported %d calendar date exceptions", stats["operating_day_exception"])
 
             # 8 & 9. Trips and StopTimes
@@ -272,7 +302,7 @@ class GtfsImporter:
                 })
 
             if journey_patterns:
-                stats["journey_pattern"] = db.upsert("journey_pattern", journey_patterns)
+                self._flush_table(db, stats, "journey_pattern", journey_patterns)
 
             sj_index = {sj["id"]: i for i, sj in enumerate(service_journeys)}
 
@@ -302,12 +332,12 @@ class GtfsImporter:
                         service_journeys[idx]["departure_time"] = row["departure_time"]
 
             if service_journeys:
-                stats["service_journey"] = db.upsert("service_journey", service_journeys)
+                self._flush_table(db, stats, "service_journey", service_journeys)
                 logger.info("Imported %d service journeys", stats["service_journey"])
             if points_in_jp:
-                stats["point_in_journey_pattern"] = db.upsert("point_in_journey_pattern", points_in_jp)
+                self._flush_table(db, stats, "point_in_journey_pattern", points_in_jp)
             if passing_times:
-                stats["passing_time"] = db.upsert("passing_time", passing_times)
+                self._flush_table(db, stats, "passing_time", passing_times)
                 logger.info("Imported %d passing times", stats["passing_time"])
 
             # 10. FeedInfo
@@ -325,7 +355,7 @@ class GtfsImporter:
                     "contact_url": row.get("feed_contact_url"),
                 })
             if feed_infos:
-                stats["feed_info"] = db.upsert("feed_info", feed_infos)
+                self._flush_table(db, stats, "feed_info", feed_infos)
 
             # 11. Shapes
             shape_points = []
@@ -338,7 +368,7 @@ class GtfsImporter:
                     "dist_traveled": float(row["shape_dist_traveled"]) if row.get("shape_dist_traveled") else None,
                 })
             if shape_points:
-                stats["shape_point"] = db.upsert("shape_point", shape_points)
+                self._flush_table(db, stats, "shape_point", shape_points)
                 logger.info("Imported %d shape points", stats["shape_point"])
 
             # 12. Frequencies
@@ -353,7 +383,7 @@ class GtfsImporter:
                     "exact_times": int(et) if et and et.strip() else 0,
                 })
             if frequencies:
-                stats["frequency"] = db.upsert("frequency", frequencies)
+                self._flush_table(db, stats, "frequency", frequencies)
                 logger.info("Imported %d frequencies", stats["frequency"])
 
             # 13. Transfers
@@ -368,7 +398,7 @@ class GtfsImporter:
                     "min_transfer_time": int(mtt) if mtt and mtt.strip() else None,
                 })
             if transfers:
-                stats["transfer"] = db.upsert("transfer", transfers)
+                self._flush_table(db, stats, "transfer", transfers)
                 logger.info("Imported %d transfers", stats["transfer"])
 
             # 14. Fare Attributes
@@ -386,7 +416,7 @@ class GtfsImporter:
                     "transfer_duration": int(td) if td and td.strip() else None,
                 })
             if fare_attrs:
-                stats["fare_attribute"] = db.upsert("fare_attribute", fare_attrs)
+                self._flush_table(db, stats, "fare_attribute", fare_attrs)
                 logger.info("Imported %d fare attributes", stats["fare_attribute"])
 
             # 15. Fare Rules
@@ -400,7 +430,7 @@ class GtfsImporter:
                     "contains_id": row.get("contains_id", ""),
                 })
             if fare_rules:
-                stats["fare_rule"] = db.upsert("fare_rule", fare_rules)
+                self._flush_table(db, stats, "fare_rule", fare_rules)
                 logger.info("Imported %d fare rules", stats["fare_rule"])
 
             # 16. Translations
@@ -416,7 +446,7 @@ class GtfsImporter:
                     "field_value": row.get("field_value", ""),
                 })
             if translations:
-                stats["translation"] = db.upsert("translation", translations)
+                self._flush_table(db, stats, "translation", translations)
                 logger.info("Imported %d translations", stats["translation"])
 
             # 17. Attributions
@@ -436,7 +466,7 @@ class GtfsImporter:
                     "attribution_phone": row.get("attribution_phone") or None,
                 })
             if attributions:
-                stats["attribution"] = db.upsert("attribution", attributions)
+                self._flush_table(db, stats, "attribution", attributions)
                 logger.info("Imported %d attributions", stats["attribution"])
 
         if warnings:

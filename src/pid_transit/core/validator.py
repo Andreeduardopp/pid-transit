@@ -174,7 +174,10 @@ def validate_transmodel(db: TransmodelDatabase) -> ValidationReport:
 
     # --- V10: Stop coordinates plausibility ---
     for s in stops:
-        lat, lon = s.get("lat", 0), s.get("lon", 0)
+        # lat/lon are nullable since schema 3.1; treat missing as (0,0) so the
+        # null-island warning fires instead of abs(None) crashing below.
+        lat = s.get("lat") or 0
+        lon = s.get("lon") or 0
         if lat == 0 and lon == 0:
             report._append(ValidationIssue(
                 entity_type="scheduled_stop_point",

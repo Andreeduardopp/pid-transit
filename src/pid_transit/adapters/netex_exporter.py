@@ -32,6 +32,26 @@ def _normalize_time(gtfs_time: str) -> tuple[str, int]:
     return f"{h:02d}:{m:02d}:{s:02d}", day_offset
 
 
+def _iso_date(gtfs_date: str) -> str:
+    """GTFS YYYYMMDD (or already dashed) -> ISO YYYY-MM-DD."""
+    d = gtfs_date.replace("-", "").strip()
+    return f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+
+
+def _wheelchair_to_access(value) -> str:
+    """GTFS wheelchair code -> NeTEx MobilityImpairedAccess LimitationStatus."""
+    return {1: "true", 2: "false"}.get(value, "unknown")
+
+
+def _write_accessibility(parent: ET.Element, entity_id: str, wheelchair) -> None:
+    if wheelchair not in (1, 2):
+        return
+    assessment = ET.SubElement(parent, "AccessibilityAssessment", attrib={
+        "id": f"{entity_id}:access", "version": "1"
+    })
+    ET.SubElement(assessment, "MobilityImpairedAccess").text = _wheelchair_to_access(wheelchair)
+
+
 class NetexExporter:
     """
     Exports a TransmodelDatabase to a NeTEx XML file (PT-EPIP profile).
@@ -168,10 +188,12 @@ class NetexExporter:
                 "id": sp["id"], "version": "1"
             })
             ET.SubElement(el, "Name").text = sp["name"]
-            centroid = ET.SubElement(el, "Centroid")
-            location = ET.SubElement(centroid, "Location")
-            ET.SubElement(location, "Longitude").text = str(sp["lon"])
-            ET.SubElement(location, "Latitude").text = str(sp["lat"])
+            if sp.get("lat") is not None and sp.get("lon") is not None:
+                centroid = ET.SubElement(el, "Centroid")
+                location = ET.SubElement(centroid, "Location")
+                ET.SubElement(location, "Longitude").text = str(sp["lon"])
+                ET.SubElement(location, "Latitude").text = str(sp["lat"])
+            _write_accessibility(el, sp["id"], sp.get("wheelchair_boarding"))
             ET.SubElement(el, "StopPlaceType").text = "onstreetBus"
 
         # Emit Quays as direct children of the SiteFrame (siblings of stopPlaces),
@@ -186,10 +208,12 @@ class NetexExporter:
                 "id": f"{sp['id']}:Quay", "version": "1"
             })
             ET.SubElement(quay, "Name").text = sp["name"]
-            q_centroid = ET.SubElement(quay, "Centroid")
-            q_location = ET.SubElement(q_centroid, "Location")
-            ET.SubElement(q_location, "Longitude").text = str(sp["lon"])
-            ET.SubElement(q_location, "Latitude").text = str(sp["lat"])
+            if sp.get("lat") is not None and sp.get("lon") is not None:
+                q_centroid = ET.SubElement(quay, "Centroid")
+                q_location = ET.SubElement(q_centroid, "Location")
+                ET.SubElement(q_location, "Longitude").text = str(sp["lon"])
+                ET.SubElement(q_location, "Latitude").text = str(sp["lat"])
+            _write_accessibility(quay, f"{sp['id']}:Quay", sp.get("wheelchair_boarding"))
 
     # -------------------------------------------------------------------------
     # ServiceFrame — lines, scheduled stop points, journey patterns
@@ -245,6 +269,26 @@ class NetexExporter:
             if self._canonical_jps is not None:
                 patterns = [jp for jp in patterns if jp["id"] in self._canonical_jps]
 
+            # Shapes ride along on their journey pattern as a
+            # LinkSequenceProjection (a JourneyPattern is a LinkSequence).
+            # Patterns are mapped to the shape of their journeys; per-journey
+            # shape variation within one pattern is not representable here.
+            jp_shape: dict = {}
+            shapes_by_id: dict = {}
+            shape_points = db.get_records("shape_point")
+            if shape_points:
+                for sp in shape_points:
+                    shapes_by_id.setdefault(sp["shape_id"], []).append(sp)
+                for pts in shapes_by_id.values():
+                    pts.sort(key=lambda p: p["sequence"])
+                for sj in db.get_records("service_journey"):
+                    sid = sj.get("shape_id")
+                    jp_id = sj.get("journey_pattern_id")
+                    if sid and jp_id and jp_id not in jp_shape and sid in shapes_by_id:
+                        jp_shape[jp_id] = sid
+                        if self._jp_remap:
+                            jp_shape.setdefault(self._jp_remap.get(jp_id, jp_id), sid)
+
             patterns_el = ET.SubElement(frame, "journeyPatterns")
             for jp in patterns:
                 el = ET.SubElement(patterns_el, "JourneyPattern", attrib={
@@ -252,6 +296,19 @@ class NetexExporter:
                 })
                 if jp.get("direction"):
                     ET.SubElement(el, "DirectionType").text = jp["direction"]
+
+                shape_id = jp_shape.get(jp["id"])
+                if shape_id:
+                    projections = ET.SubElement(el, "projections")
+                    proj = ET.SubElement(projections, "LinkSequenceProjection", attrib={
+                        "id": shape_id, "version": "1"
+                    })
+                    line_string = ET.SubElement(proj, "gml:LineString", attrib={
+                        "gml:id": f"ls_{jp['id'].replace(':', '_')}"
+                    })
+                    ET.SubElement(line_string, "gml:posList").text = " ".join(
+                        f"{p['lat']} {p['lon']}" for p in shapes_by_id[shape_id]
+                    )
 
                 pattern_pts = points_by_pattern.get(jp["id"], [])
                 if pattern_pts:
@@ -266,6 +323,30 @@ class NetexExporter:
                         ET.SubElement(spi, "ScheduledStopPointRef", attrib={
                             "ref": pt["stop_point_id"], "version": "1"
                         })
+
+        transfers = db.get_records("transfer")
+        if transfers:
+            connections = ET.SubElement(frame, "connections")
+            for i, tr in enumerate(transfers, 1):
+                conn = ET.SubElement(connections, "Connection", attrib={
+                    "id": f"PID:Connection:{i}", "version": "1"
+                })
+                if tr.get("transfer_type"):
+                    key_list = ET.SubElement(conn, "keyList")
+                    kv = ET.SubElement(key_list, "KeyValue")
+                    ET.SubElement(kv, "Key").text = "gtfs_transfer_type"
+                    ET.SubElement(kv, "Value").text = str(tr["transfer_type"])
+                if tr.get("min_transfer_time") is not None:
+                    wtd = ET.SubElement(conn, "WalkTransferDuration")
+                    ET.SubElement(wtd, "DefaultDuration").text = f"PT{tr['min_transfer_time']}S"
+                from_el = ET.SubElement(conn, "From")
+                ET.SubElement(from_el, "ScheduledStopPointRef", attrib={
+                    "ref": tr["from_stop_id"], "version": "1"
+                })
+                to_el = ET.SubElement(conn, "To")
+                ET.SubElement(to_el, "ScheduledStopPointRef", attrib={
+                    "ref": tr["to_stop_id"], "version": "1"
+                })
 
     # -------------------------------------------------------------------------
     # ServiceCalendarFrame — day types
@@ -284,12 +365,30 @@ class NetexExporter:
             el = ET.SubElement(dt_container, "DayType", attrib={
                 "id": dt["id"], "version": "1"
             })
+            valid_between = ET.SubElement(el, "ValidBetween")
+            ET.SubElement(valid_between, "FromDate").text = f"{_iso_date(dt['start_date'])}T00:00:00"
+            ET.SubElement(valid_between, "ToDate").text = f"{_iso_date(dt['end_date'])}T23:59:59"
             active = " ".join(
                 name for flag, name in DAY_FLAG_TO_NAME if dt.get(flag)
             )
             if active:
                 pod = ET.SubElement(ET.SubElement(el, "properties"), "PropertyOfDay")
                 ET.SubElement(pod, "DaysOfWeek").text = active
+
+        exceptions = db.get_records("operating_day_exception")
+        if exceptions:
+            assignments = ET.SubElement(frame, "dayTypeAssignments")
+            for i, exc in enumerate(exceptions, 1):
+                a = ET.SubElement(assignments, "DayTypeAssignment", attrib={
+                    "id": f"PID:DayTypeAssignment:{i}", "version": "1", "order": str(i)
+                })
+                ET.SubElement(a, "Date").text = _iso_date(exc["date"])
+                ET.SubElement(a, "DayTypeRef", attrib={
+                    "ref": exc["day_type_id"], "version": "1"
+                })
+                ET.SubElement(a, "isAvailable").text = (
+                    "true" if exc["is_addition"] else "false"
+                )
 
     # -------------------------------------------------------------------------
     # TimetableFrame — service journeys, passing times
@@ -312,12 +411,21 @@ class NetexExporter:
         for pts in pt_by_journey.values():
             pts.sort(key=lambda p: p["order"])
 
+        freq_by_journey: dict = {}
+        for fr in db.get_records("frequency"):
+            freq_by_journey.setdefault(fr["service_journey_id"], []).append(fr)
+
         if journeys:
             journeys_el = ET.SubElement(frame, "vehicleJourneys")
             for sj in journeys:
-                el = ET.SubElement(journeys_el, "ServiceJourney", attrib={
+                # Frequency-based journeys are TemplateServiceJourneys (the
+                # ServiceJourney subtype that carries frequency groups).
+                frequencies = freq_by_journey.get(sj["id"], [])
+                tag = "TemplateServiceJourney" if frequencies else "ServiceJourney"
+                el = ET.SubElement(journeys_el, tag, attrib={
                     "id": sj["id"], "version": "1"
                 })
+                _write_accessibility(el, sj["id"], sj.get("wheelchair_accessible"))
                 dep_time, dep_offset = _normalize_time(sj["departure_time"])
                 ET.SubElement(el, "DepartureTime").text = dep_time
                 if dep_offset:
@@ -336,6 +444,23 @@ class NetexExporter:
                 ET.SubElement(el, "LineRef", attrib={
                     "ref": sj["line_id"], "version": "1"
                 })
+
+                if frequencies:
+                    groups_el = ET.SubElement(el, "frequencyGroups")
+                    for i, fr in enumerate(frequencies, 1):
+                        hjg = ET.SubElement(groups_el, "HeadwayJourneyGroup", attrib={
+                            "id": f"{sj['id']}:hjg:{i}", "version": "1"
+                        })
+                        if fr.get("exact_times"):
+                            key_list = ET.SubElement(hjg, "keyList")
+                            kv = ET.SubElement(key_list, "KeyValue")
+                            ET.SubElement(kv, "Key").text = "gtfs_exact_times"
+                            ET.SubElement(kv, "Value").text = str(fr["exact_times"])
+                        ET.SubElement(hjg, "ScheduledHeadwayInterval").text = (
+                            f"PT{fr['headway_secs']}S"
+                        )
+                        ET.SubElement(hjg, "FirstDepartureTime").text = fr["start_time"]
+                        ET.SubElement(hjg, "LastDepartureTime").text = fr["end_time"]
 
                 sj_pts = pt_by_journey.get(sj["id"], [])
                 if sj_pts:
