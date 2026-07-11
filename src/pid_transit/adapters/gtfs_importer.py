@@ -4,9 +4,10 @@ GTFS Importer Adapter (Object-Oriented).
 
 import csv
 import io
+import json
 import zipfile
 import logging
-from typing import Dict, Any, Union
+from typing import Dict, Any, Optional, Union
 from pathlib import Path
 
 from ..core.database import TransmodelDatabase
@@ -36,6 +37,99 @@ def _safe_int(val: str, default: int = 0) -> int:
         return int(val)
     except (ValueError, TypeError):
         return default
+
+
+def _opt_int(val: Optional[str]) -> Optional[int]:
+    """Empty/absent -> None, otherwise int (None on garbage)."""
+    if val is None or val.strip() == "":
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _opt_float(val: Optional[str]) -> Optional[float]:
+    """Empty/absent -> None, otherwise float (None on garbage)."""
+    if val is None or val.strip() == "":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extras_json(row: Dict[str, str], consumed: frozenset,
+                 force: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Serialize source columns not mapped to a model field as sorted JSON.
+
+    Empty values are dropped (an absent column and an empty cell both
+    round-trip to "not present"). `force` pins mapped-but-lossy fields
+    (e.g. the original route_type) so exports can reproduce them exactly.
+    """
+    extra = {k: v for k, v in row.items() if k not in consumed and v != ""}
+    if force:
+        extra.update(force)
+    if not extra:
+        return None
+    return json.dumps(extra, sort_keys=True, ensure_ascii=False)
+
+
+# Columns each GTFS file maps onto model fields; everything else goes to extras.
+_CONSUMED = {
+    "agency": frozenset({"agency_id", "agency_name", "agency_url",
+                         "agency_timezone", "agency_lang", "agency_phone"}),
+    "routes": frozenset({"route_id", "agency_id", "route_short_name",
+                         "route_long_name", "route_type", "route_color",
+                         "route_text_color", "route_desc", "route_url",
+                         "route_sort_order"}),
+    "levels": frozenset({"level_id", "level_index", "level_name"}),
+    "stops_point": frozenset({"stop_id", "stop_name", "stop_lat", "stop_lon",
+                              "location_type", "parent_station",
+                              "wheelchair_boarding", "stop_code",
+                              "platform_code", "zone_id", "stop_desc"}),
+    "stops_area": frozenset({"stop_id", "stop_name", "stop_lat", "stop_lon",
+                             "location_type", "parent_station", "level_id",
+                             "wheelchair_boarding"}),
+    "pathways": frozenset({"pathway_id", "from_stop_id", "to_stop_id",
+                           "pathway_mode", "is_bidirectional", "length",
+                           "traversal_time", "stair_count", "max_slope",
+                           "min_width", "signposted_as",
+                           "reversed_signposted_as"}),
+    "calendar": frozenset({"service_id", "monday", "tuesday", "wednesday",
+                           "thursday", "friday", "saturday", "sunday",
+                           "start_date", "end_date"}),
+    "calendar_dates": frozenset({"service_id", "date", "exception_type"}),
+    "trips": frozenset({"trip_id", "route_id", "service_id", "direction_id",
+                        "wheelchair_accessible", "bikes_allowed", "shape_id",
+                        "trip_headsign", "trip_short_name", "block_id"}),
+    "stop_times": frozenset({"trip_id", "stop_id", "stop_sequence",
+                             "arrival_time", "departure_time", "pickup_type",
+                             "drop_off_type", "timepoint", "stop_headsign",
+                             "shape_dist_traveled"}),
+    "feed_info": frozenset({"feed_publisher_name", "feed_publisher_url",
+                            "feed_lang", "feed_start_date", "feed_end_date",
+                            "feed_version", "feed_contact_email",
+                            "feed_contact_url"}),
+    "shapes": frozenset({"shape_id", "shape_pt_lat", "shape_pt_lon",
+                         "shape_pt_sequence", "shape_dist_traveled"}),
+    "frequencies": frozenset({"trip_id", "start_time", "end_time",
+                              "headway_secs", "exact_times"}),
+    "transfers": frozenset({"from_stop_id", "to_stop_id", "transfer_type",
+                            "min_transfer_time"}),
+    "fare_attributes": frozenset({"fare_id", "price", "currency_type",
+                                  "payment_method", "transfers", "agency_id",
+                                  "transfer_duration"}),
+    "fare_rules": frozenset({"fare_id", "route_id", "origin_id",
+                             "destination_id", "contains_id"}),
+    "translations": frozenset({"table_name", "field_name", "language",
+                               "translation", "record_id", "record_sub_id",
+                               "field_value"}),
+    "attributions": frozenset({"attribution_id", "organization_name",
+                               "is_producer", "is_operator", "is_authority",
+                               "attribution_url", "attribution_email",
+                               "attribution_phone"}),
+}
 
 
 class GtfsImporter:
@@ -95,7 +189,9 @@ class GtfsImporter:
         rt = _safe_int(str(route_type), default=3)
         _BASIC = {0: TransportMode.TRAM, 1: TransportMode.METRO,
                   2: TransportMode.RAIL, 3: TransportMode.BUS,
-                  4: TransportMode.FERRY}
+                  4: TransportMode.FERRY, 5: TransportMode.CABLE_CAR,
+                  6: TransportMode.GONDOLA, 7: TransportMode.FUNICULAR,
+                  11: TransportMode.TROLLEYBUS, 12: TransportMode.MONORAIL}
         if rt in _BASIC:
             return _BASIC[rt]
         # Extended route types (GTFS-extensions / Google Transit)
@@ -103,8 +199,11 @@ class GtfsImporter:
         if 200 <= rt <= 299: return TransportMode.BUS   # coach
         if 400 <= rt <= 499: return TransportMode.METRO
         if 700 <= rt <= 799: return TransportMode.BUS
+        if 800 <= rt <= 899: return TransportMode.TROLLEYBUS
         if 900 <= rt <= 999: return TransportMode.TRAM
         if 1000 <= rt <= 1099: return TransportMode.FERRY
+        if 1300 <= rt <= 1399: return TransportMode.GONDOLA
+        if 1400 <= rt <= 1499: return TransportMode.FUNICULAR
         logger.info("Unmapped route_type %d, defaulting to OTHER", rt)
         return TransportMode.OTHER
 
@@ -119,12 +218,13 @@ class GtfsImporter:
             operators = []
             for row in self._iter_csv_rows(zf, "agency.txt"):
                 operators.append({
-                    "id": row.get("agency_id", "default_agency"),
-                    "name": row.get("agency_name", "Unknown Agency"),
-                    "url": row.get("agency_url"),
-                    "timezone": row.get("agency_timezone", self.fallback_timezone),
-                    "lang": row.get("agency_lang"),
-                    "phone": row.get("agency_phone")
+                    "id": row.get("agency_id") or "default_agency",
+                    "name": row.get("agency_name") or "Unknown Agency",
+                    "url": row.get("agency_url") or None,
+                    "timezone": row.get("agency_timezone") or self.fallback_timezone,
+                    "lang": row.get("agency_lang") or None,
+                    "phone": row.get("agency_phone") or None,
+                    "extras": _extras_json(row, _CONSUMED["agency"]),
                 })
             if operators:
                 self._flush_table(db, stats, "operator", operators)
@@ -138,13 +238,23 @@ class GtfsImporter:
             # 2. Lines
             lines = []
             for row in self._iter_csv_rows(zf, "routes.txt"):
+                # The original route_type is pinned in extras so the exporter
+                # can reproduce it exactly (extended types would otherwise
+                # collapse to their basic mode).
+                route_type = str(_safe_int(row.get("route_type"), default=3))
                 lines.append({
                     "id": row["route_id"],
                     "operator_id": row.get("agency_id") or default_op_id,
                     "name": row.get("route_long_name") or row.get("route_short_name") or "Unnamed",
-                    "short_name": row.get("route_short_name"),
-                    "transport_mode": self._gtfs_route_type_to_mode(row.get("route_type", "3")),
-                    "color": row.get("route_color")
+                    "short_name": row.get("route_short_name") or None,
+                    "transport_mode": self._gtfs_route_type_to_mode(route_type),
+                    "color": row.get("route_color") or None,
+                    "text_color": row.get("route_text_color") or None,
+                    "description": row.get("route_desc") or None,
+                    "url": row.get("route_url") or None,
+                    "sort_order": _opt_int(row.get("route_sort_order")),
+                    "extras": _extras_json(row, _CONSUMED["routes"],
+                                           force={"route_type": route_type}),
                 })
             if lines:
                 self._flush_table(db, stats, "line", lines)
@@ -157,7 +267,8 @@ class GtfsImporter:
                 levels.append({
                     "id": row["level_id"],
                     "index": idx if idx is not None else 0.0,
-                    "name": row.get("level_name"),
+                    "name": row.get("level_name") or None,
+                    "extras": _extras_json(row, _CONSUMED["levels"]),
                 })
             if levels:
                 self._flush_table(db, stats, "level", levels)
@@ -180,22 +291,28 @@ class GtfsImporter:
                         continue
                     stops.append({
                         "id": stop_id,
-                        "name": row.get("stop_name", "Unnamed Stop"),
+                        "name": row.get("stop_name") or "Unnamed Stop",
                         "lat": lat,
                         "lon": lon,
-                        "stop_area_id": row.get("parent_station"),
+                        "stop_area_id": row.get("parent_station") or None,
                         "wheelchair_boarding": wb_val,
+                        "code": row.get("stop_code") or None,
+                        "platform_code": row.get("platform_code") or None,
+                        "zone_id": row.get("zone_id") or None,
+                        "description": row.get("stop_desc") or None,
+                        "extras": _extras_json(row, _CONSUMED["stops_point"]),
                     })
                 elif loc_type in ("1", "2", "3", "4"):
                     stop_areas.append({
                         "id": stop_id,
-                        "name": row.get("stop_name", "Unnamed Stop Area"),
+                        "name": row.get("stop_name") or "Unnamed Stop Area",
                         "lat": lat,
                         "lon": lon,
                         "location_type": int(loc_type),
                         "parent_id": row.get("parent_station") or None,
                         "level_id": row.get("level_id") or None,
                         "wheelchair_boarding": wb_val,
+                        "extras": _extras_json(row, _CONSUMED["stops_area"]),
                     })
             if stop_areas:
                 self._flush_table(db, stats, "stop_area", stop_areas)
@@ -221,6 +338,7 @@ class GtfsImporter:
                     "min_width": _safe_float(row.get("min_width", ""), "min_width", row["pathway_id"]),
                     "signposted_as": row.get("signposted_as") or None,
                     "reversed_signposted_as": row.get("reversed_signposted_as") or None,
+                    "extras": _extras_json(row, _CONSUMED["pathways"]),
                 })
             if pathways:
                 self._flush_table(db, stats, "pathway", pathways)
@@ -239,7 +357,8 @@ class GtfsImporter:
                     "saturday": row.get("saturday") == "1",
                     "sunday": row.get("sunday") == "1",
                     "start_date": row["start_date"],
-                    "end_date": row["end_date"]
+                    "end_date": row["end_date"],
+                    "extras": _extras_json(row, _CONSUMED["calendar"]),
                 })
             if day_types:
                 self._flush_table(db, stats, "day_type", day_types)
@@ -251,7 +370,8 @@ class GtfsImporter:
                 exceptions.append({
                     "day_type_id": row["service_id"],
                     "date": row["date"],
-                    "is_addition": row.get("exception_type") == "1"
+                    "is_addition": row.get("exception_type") == "1",
+                    "extras": _extras_json(row, _CONSUMED["calendar_dates"]),
                 })
             if exceptions:
                 known_day_type_ids = {dt["id"] for dt in day_types}
@@ -288,17 +408,19 @@ class GtfsImporter:
                     "direction": direction
                 })
 
-                wa = row.get("wheelchair_accessible")
-                ba = row.get("bikes_allowed")
                 service_journeys.append({
                     "id": row["trip_id"],
                     "line_id": row["route_id"],
                     "journey_pattern_id": jp_id,
                     "day_type_id": row["service_id"],
                     "departure_time": "00:00:00",
-                    "wheelchair_accessible": int(wa) if wa and wa.strip() else None,
-                    "bikes_allowed": int(ba) if ba and ba.strip() else None,
+                    "wheelchair_accessible": _opt_int(row.get("wheelchair_accessible")),
+                    "bikes_allowed": _opt_int(row.get("bikes_allowed")),
                     "shape_id": row.get("shape_id") or None,
+                    "headsign": row.get("trip_headsign") or None,
+                    "short_name": row.get("trip_short_name") or None,
+                    "block_id": row.get("block_id") or None,
+                    "extras": _extras_json(row, _CONSUMED["trips"]),
                 })
 
             if journey_patterns:
@@ -322,8 +444,14 @@ class GtfsImporter:
                     "service_journey_id": trip_id,
                     "stop_point_id": row["stop_id"],
                     "order": int(row["stop_sequence"]),
-                    "arrival_time": row.get("arrival_time"),
-                    "departure_time": row.get("departure_time")
+                    "arrival_time": row.get("arrival_time") or None,
+                    "departure_time": row.get("departure_time") or None,
+                    "pickup_type": _opt_int(row.get("pickup_type")),
+                    "drop_off_type": _opt_int(row.get("drop_off_type")),
+                    "timepoint": _opt_int(row.get("timepoint")),
+                    "stop_headsign": row.get("stop_headsign") or None,
+                    "shape_dist_traveled": _opt_float(row.get("shape_dist_traveled")),
+                    "extras": _extras_json(row, _CONSUMED["stop_times"]),
                 })
 
                 if int(row["stop_sequence"]) in (0, 1) and row.get("departure_time"):
@@ -345,14 +473,15 @@ class GtfsImporter:
             for row in self._iter_csv_rows(zf, "feed_info.txt"):
                 feed_infos.append({
                     "id": "default_feed",
-                    "publisher_name": row.get("feed_publisher_name", "Unknown"),
-                    "publisher_url": row.get("feed_publisher_url", ""),
-                    "lang": row.get("feed_lang", "en"),
-                    "start_date": row.get("feed_start_date"),
-                    "end_date": row.get("feed_end_date"),
-                    "version": row.get("feed_version"),
-                    "contact_email": row.get("feed_contact_email"),
-                    "contact_url": row.get("feed_contact_url"),
+                    "publisher_name": row.get("feed_publisher_name") or "Unknown",
+                    "publisher_url": row.get("feed_publisher_url") or "",
+                    "lang": row.get("feed_lang") or "en",
+                    "start_date": row.get("feed_start_date") or None,
+                    "end_date": row.get("feed_end_date") or None,
+                    "version": row.get("feed_version") or None,
+                    "contact_email": row.get("feed_contact_email") or None,
+                    "contact_url": row.get("feed_contact_url") or None,
+                    "extras": _extras_json(row, _CONSUMED["feed_info"]),
                 })
             if feed_infos:
                 self._flush_table(db, stats, "feed_info", feed_infos)
@@ -365,7 +494,8 @@ class GtfsImporter:
                     "lat": float(row["shape_pt_lat"]),
                     "lon": float(row["shape_pt_lon"]),
                     "sequence": int(row["shape_pt_sequence"]),
-                    "dist_traveled": float(row["shape_dist_traveled"]) if row.get("shape_dist_traveled") else None,
+                    "dist_traveled": _opt_float(row.get("shape_dist_traveled")),
+                    "extras": _extras_json(row, _CONSUMED["shapes"]),
                 })
             if shape_points:
                 self._flush_table(db, stats, "shape_point", shape_points)
@@ -374,13 +504,13 @@ class GtfsImporter:
             # 12. Frequencies
             frequencies = []
             for row in self._iter_csv_rows(zf, "frequencies.txt"):
-                et = row.get("exact_times")
                 frequencies.append({
                     "service_journey_id": row["trip_id"],
                     "start_time": row["start_time"],
                     "end_time": row["end_time"],
                     "headway_secs": int(row["headway_secs"]),
-                    "exact_times": int(et) if et and et.strip() else 0,
+                    "exact_times": _opt_int(row.get("exact_times")) or 0,
+                    "extras": _extras_json(row, _CONSUMED["frequencies"]),
                 })
             if frequencies:
                 self._flush_table(db, stats, "frequency", frequencies)
@@ -389,13 +519,12 @@ class GtfsImporter:
             # 13. Transfers
             transfers = []
             for row in self._iter_csv_rows(zf, "transfers.txt"):
-                tt = row.get("transfer_type", "0")
-                mtt = row.get("min_transfer_time")
                 transfers.append({
                     "from_stop_id": row["from_stop_id"],
                     "to_stop_id": row["to_stop_id"],
-                    "transfer_type": int(tt) if tt and tt.strip() else 0,
-                    "min_transfer_time": int(mtt) if mtt and mtt.strip() else None,
+                    "transfer_type": _opt_int(row.get("transfer_type")) or 0,
+                    "min_transfer_time": _opt_int(row.get("min_transfer_time")),
+                    "extras": _extras_json(row, _CONSUMED["transfers"]),
                 })
             if transfers:
                 self._flush_table(db, stats, "transfer", transfers)
@@ -404,16 +533,15 @@ class GtfsImporter:
             # 14. Fare Attributes
             fare_attrs = []
             for row in self._iter_csv_rows(zf, "fare_attributes.txt"):
-                tr = row.get("transfers")
-                td = row.get("transfer_duration")
                 fare_attrs.append({
                     "id": row["fare_id"],
-                    "price": float(row.get("price", "0")),
-                    "currency_type": row.get("currency_type", ""),
+                    "price": _opt_float(row.get("price")) or 0.0,
+                    "currency_type": row.get("currency_type") or "",
                     "payment_method": _safe_int(row.get("payment_method", "0")),
-                    "transfers": int(tr) if tr and tr.strip() else None,
+                    "transfers": _opt_int(row.get("transfers")),
                     "operator_id": row.get("agency_id") or None,
-                    "transfer_duration": int(td) if td and td.strip() else None,
+                    "transfer_duration": _opt_int(row.get("transfer_duration")),
+                    "extras": _extras_json(row, _CONSUMED["fare_attributes"]),
                 })
             if fare_attrs:
                 self._flush_table(db, stats, "fare_attribute", fare_attrs)
@@ -428,6 +556,7 @@ class GtfsImporter:
                     "origin_id": row.get("origin_id", ""),
                     "destination_id": row.get("destination_id", ""),
                     "contains_id": row.get("contains_id", ""),
+                    "extras": _extras_json(row, _CONSUMED["fare_rules"]),
                 })
             if fare_rules:
                 self._flush_table(db, stats, "fare_rule", fare_rules)
@@ -444,6 +573,7 @@ class GtfsImporter:
                     "record_id": row.get("record_id", ""),
                     "record_sub_id": row.get("record_sub_id", ""),
                     "field_value": row.get("field_value", ""),
+                    "extras": _extras_json(row, _CONSUMED["translations"]),
                 })
             if translations:
                 self._flush_table(db, stats, "translation", translations)
@@ -457,13 +587,14 @@ class GtfsImporter:
                 ia = row.get("is_authority")
                 attributions.append({
                     "id": row.get("attribution_id") or f"attr_{i}",
-                    "organization_name": row.get("organization_name", "Unknown"),
+                    "organization_name": row.get("organization_name") or "Unknown",
                     "is_producer": ip == "1" if ip and ip.strip() else None,
                     "is_operator": io == "1" if io and io.strip() else None,
                     "is_authority": ia == "1" if ia and ia.strip() else None,
                     "attribution_url": row.get("attribution_url") or None,
                     "attribution_email": row.get("attribution_email") or None,
                     "attribution_phone": row.get("attribution_phone") or None,
+                    "extras": _extras_json(row, _CONSUMED["attributions"]),
                 })
             if attributions:
                 self._flush_table(db, stats, "attribution", attributions)

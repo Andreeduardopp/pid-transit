@@ -41,6 +41,44 @@ _DAY_NAMES = {
 
 BATCH_SIZE = 5000
 
+# NeTEx VehicleMode strings -> internal TransportMode values. NeTEx casing
+# and vocabulary differ from ours (trolleyBus, cableway, water, ...); unknown
+# modes fall back to "other" so they never fail model validation later.
+_NETEX_MODE_TO_INTERNAL = {
+    "bus": "bus",
+    "coach": "bus",
+    "tram": "tram",
+    "rail": "rail",
+    "urbanRail": "rail",
+    "intercityRail": "rail",
+    "metro": "metro",
+    "underground": "metro",
+    "tube": "metro",
+    "ferry": "ferry",
+    "water": "ferry",
+    "trolleyBus": "trolleybus",
+    "funicular": "funicular",
+    "cableway": "cable_car",
+    "cableCar": "cable_car",
+    "telecabin": "gondola",
+    "gondola": "gondola",
+    "monorail": "monorail",
+    # Identity mappings for values this library's own exporter emitted
+    "trolleybus": "trolleybus",
+    "cable_car": "cable_car",
+    "other": "other",
+}
+
+
+def _normalize_mode(mode: Optional[str]) -> str:
+    if not mode:
+        return "bus"
+    normalized = _NETEX_MODE_TO_INTERNAL.get(mode)
+    if normalized is None:
+        logger.info("Unmapped NeTEx TransportMode '%s', storing as 'other'", mode)
+        return "other"
+    return normalized
+
 
 def _text(el: Optional[ET.Element]) -> Optional[str]:
     if el is not None and el.text:
@@ -180,6 +218,10 @@ class _RunState:
         self.jp_spi_to_stop: Dict[str, Dict[str, str]] = {}
         self.stop_ids: set = set()      # stops actually imported
         self.pattern_ids: set = set()   # journey patterns actually imported
+        # files where pass 1 saw (Template)ServiceJourney elements; pass 2
+        # skips the rest (site/resource/calendar files) instead of re-parsing
+        self.current_file: Optional[str] = None
+        self.files_with_journeys: set = set()
 
     def add_stat(self, key: str, n: int) -> None:
         if n:
@@ -246,6 +288,7 @@ class NetexImporter:
             for i, (label, opener) in enumerate(sources, 1):
                 self._check_cancel()
                 self._file_index = i
+                state.current_file = label
                 logger.info("NeTEx pass 1 (reference data, file %d/%d): %s", i, n, label)
                 with opener() as f:
                     self._stream(f, pass1_handlers, label)
@@ -256,6 +299,10 @@ class NetexImporter:
             for i, (label, opener) in enumerate(sources, 1):
                 self._check_cancel()
                 self._file_index = i
+                if label not in state.files_with_journeys:
+                    logger.info(
+                        "NeTEx pass 2: skipping %s (no service journeys)", label)
+                    continue
                 logger.info("NeTEx pass 2 (service journeys, file %d/%d): %s", i, n, label)
                 with opener() as f:
                     self._stream(f, pass2_handlers, label)
@@ -422,7 +469,9 @@ class NetexImporter:
                 "operator_id": op_ref.attrib.get("ref") if op_ref is not None else None,
                 "name": _text(line.find("n:Name", self._ns)) or "Unnamed",
                 "short_name": _text(line.find("n:ShortName", self._ns)),
-                "transport_mode": _text(line.find("n:TransportMode", self._ns)) or "bus",
+                "transport_mode": _normalize_mode(
+                    _text(line.find("n:TransportMode", self._ns))
+                ),
             })
 
         def on_route(route: ET.Element) -> None:
@@ -562,13 +611,25 @@ class NetexImporter:
 
         def on_service_journey(sj: ET.Element) -> None:
             # Light scan only: patterns without their own route/line reference
-            # are resolved through the journeys that use them.
-            jp_ref = sj.find("n:JourneyPatternRef", self._ns)
-            lr = sj.find("n:LineRef", self._ns)
-            if jp_ref is not None and lr is not None:
-                ref = jp_ref.attrib.get("ref")
-                if ref and ref not in state.jp_to_line:
-                    state.jp_to_line[ref] = lr.attrib.get("ref")
+            # are resolved through the journeys that use them. Also marks the
+            # file as journey-bearing so pass 2 knows to re-parse it.
+            state.files_with_journeys.add(state.current_file)
+            uri = self._ns["n"]
+            q_jp = f"{{{uri}}}JourneyPatternRef"
+            q_lr = f"{{{uri}}}LineRef"
+            jp = lr = None
+            for child in sj:
+                tag = child.tag
+                if tag == q_jp:
+                    if jp is None:
+                        jp = child.attrib.get("ref")
+                elif tag == q_lr:
+                    if lr is None:
+                        lr = child.attrib.get("ref")
+                if jp is not None and lr is not None:
+                    break
+            if jp and lr and jp not in state.jp_to_line:
+                state.jp_to_line[jp] = lr
 
         return {
             "Operator": on_operator,
@@ -719,9 +780,12 @@ class NetexImporter:
                     line_id = route_ref
             if not line_id:
                 line_id = state.jp_to_line.get(jpid)
-            # Pass 2 needs the SPI -> stop map even for skipped patterns.
+            # Pass 2 needs the SPI -> (stop, order) map even for skipped
+            # patterns. Order is converted to 0-based here so passing times
+            # imported through the map line up with point_in_journey_pattern.
             state.jp_spi_to_stop[jpid] = {
-                spi_id: ssp_ref for _, spi_id, ssp_ref in spi_points if spi_id
+                spi_id: (ssp_ref, order - 1)
+                for order, spi_id, ssp_ref in spi_points if spi_id
             }
             if not line_id or line_id not in state.line_ids:
                 logger.warning("JourneyPattern %s has no importable line reference, skipping", jpid)
@@ -807,6 +871,20 @@ class _Pass2:
         self.missing_day_types: set = set()
         self.skipped_journeys = 0
         self.dropped_call_stops = 0
+        # namespace-qualified tag cache; rebuilt when a file changes namespace
+        self._q_uri: Optional[str] = None
+        self._qt: Dict[str, str] = {}
+
+    _TAGS = (
+        "DepartureTime", "DepartureDayOffset", "LineRef", "JourneyPatternRef",
+        "ServiceJourneyPatternRef", "dayTypes", "DayTypeRef",
+        "validityConditions", "AvailabilityConditionRef", "frequencyGroups",
+        "passingTimes", "calls", "AccessibilityAssessment",
+        "MobilityImpairedAccess", "TimetabledPassingTime",
+        "StopPointInJourneyPatternRef", "ArrivalTime", "ArrivalDayOffset",
+        "Call", "ScheduledStopPointRef", "Arrival", "Departure", "Time",
+        "DayOffset",
+    )
 
     def handlers(self) -> Dict[str, callable]:
         return {
@@ -814,45 +892,104 @@ class _Pass2:
             "TemplateServiceJourney": self.on_service_journey,
         }
 
-    def _call_time(self, call: ET.Element, tag: str) -> Optional[str]:
+    def _qtags(self) -> Dict[str, str]:
+        uri = self.importer._ns["n"]
+        if uri != self._q_uri:
+            self._qt = {t: f"{{{uri}}}{t}" for t in self._TAGS}
+            self._q_uri = uri
+        return self._qt
+
+    @staticmethod
+    def _call_time(el: Optional[ET.Element], q_time: str, q_off: str) -> Optional[str]:
         """Time from a Call's Arrival/Departure child (Time + optional DayOffset)."""
-        el = call.find(tag, self.importer._ns)
         if el is None:
             return None
-        t = _text(el.find("n:Time", self.importer._ns))
+        t = off = None
+        for c in el:
+            tag = c.tag
+            if tag == q_time:
+                t = _text(c)
+            elif tag == q_off:
+                off = _text(c)
         if not t:
             return None
-        off_text = _text(el.find("n:DayOffset", self.importer._ns))
-        return _reconstruct_time(t, int(off_text) if off_text else 0)
+        return _reconstruct_time(t, int(off) if off else 0)
 
     def on_service_journey(self, sj: ET.Element) -> None:
         ns = self.importer._ns
         sjid = sj.attrib.get("id")
         if not sjid:
             return
+        # One walk over the journey's direct children replaces the dozen
+        # find() path evaluations that used to dominate pass-2 CPU.
+        Q = self._qtags()
 
-        dep_time_text = _text(sj.find("n:DepartureTime", ns)) or "00:00:00"
-        dep_offset_text = _text(sj.find("n:DepartureDayOffset", ns))
-        dep_offset = int(dep_offset_text) if dep_offset_text else 0
-        departure_time = _reconstruct_time(dep_time_text, dep_offset)
+        dep_time_text = dep_offset_text = None
+        line_id = jp_ref_id = sjp_ref_id = None
+        day_type_id = avail_ref_id = None
+        wheelchair = None
+        freq_groups = pt_container = calls_el = None
 
-        line_ref = sj.find("n:LineRef", ns)
-        line_id = line_ref.attrib.get("ref") if line_ref is not None else None
+        for child in sj:
+            tag = child.tag
+            if tag == Q["passingTimes"]:
+                if pt_container is None:
+                    pt_container = child
+            elif tag == Q["calls"]:
+                if calls_el is None:
+                    calls_el = child
+            elif tag == Q["DepartureTime"]:
+                if dep_time_text is None:
+                    dep_time_text = _text(child)
+            elif tag == Q["DepartureDayOffset"]:
+                if dep_offset_text is None:
+                    dep_offset_text = _text(child)
+            elif tag == Q["LineRef"]:
+                if line_id is None:
+                    line_id = child.attrib.get("ref")
+            elif tag == Q["JourneyPatternRef"]:
+                if jp_ref_id is None:
+                    jp_ref_id = child.attrib.get("ref")
+            elif tag == Q["ServiceJourneyPatternRef"]:
+                if sjp_ref_id is None:
+                    sjp_ref_id = child.attrib.get("ref")
+            elif tag == Q["dayTypes"]:
+                if day_type_id is None:
+                    for r in child:
+                        if r.tag == Q["DayTypeRef"]:
+                            day_type_id = r.attrib.get("ref")
+                            break
+            elif tag == Q["validityConditions"]:
+                if avail_ref_id is None:
+                    for r in child:
+                        if r.tag == Q["AvailabilityConditionRef"]:
+                            avail_ref_id = r.attrib.get("ref")
+                            break
+            elif tag == Q["frequencyGroups"]:
+                if freq_groups is None:
+                    freq_groups = child
+            elif tag == Q["AccessibilityAssessment"]:
+                if wheelchair is None:
+                    for r in child:
+                        if r.tag == Q["MobilityImpairedAccess"]:
+                            wheelchair = {"true": 1, "false": 2}.get(_text(r))
+                            break
 
-        jp_ref = sj.find("n:JourneyPatternRef", ns)
-        if jp_ref is None:
-            jp_ref = sj.find("n:ServiceJourneyPatternRef", ns)
-        jp_id = jp_ref.attrib.get("ref") if jp_ref is not None else None
+        departure_time = _reconstruct_time(
+            dep_time_text or "00:00:00",
+            int(dep_offset_text) if dep_offset_text else 0)
 
-        dt_ref = sj.find(".//n:DayTypeRef", ns)
-        if dt_ref is not None:
-            day_type_id = dt_ref.attrib.get("ref")
-        else:
-            # Swiss-profile journeys carry their calendar as an availability
-            # condition; those were materialized as day types in pass 1.
-            ac_ref = sj.find("n:validityConditions/n:AvailabilityConditionRef", ns)
-            day_type_id = ac_ref.attrib.get("ref") if ac_ref is not None else "UNKNOWN"
-        day_type_id = day_type_id or "UNKNOWN"
+        jp_id = jp_ref_id or sjp_ref_id
+
+        if day_type_id is None and avail_ref_id is None:
+            # Rare path: a DayTypeRef somewhere other than dayTypes/. Only
+            # worth the recursive scan when neither standard source matched
+            # (Swiss journeys carry an AvailabilityConditionRef instead; those
+            # were materialized as day types in pass 1).
+            dt_ref = sj.find(".//n:DayTypeRef", ns)
+            if dt_ref is not None:
+                day_type_id = dt_ref.attrib.get("ref")
+        day_type_id = day_type_id or avail_ref_id or "UNKNOWN"
 
         if not line_id or line_id not in self.state.line_ids:
             # No line, or a line the feed never defines: either would fail the
@@ -870,13 +1007,12 @@ class _Pass2:
             "journey_pattern_id": jp_id if jp_id in self.state.pattern_ids else None,
             "day_type_id": day_type_id,
             "departure_time": departure_time,
-            "wheelchair_accessible": self.importer._access_int(sj),
+            "wheelchair_accessible": wheelchair,
             "shape_id": self.state.jp_shape.get(jp_id) if jp_id else None,
         })
 
-        groups_el = sj.find("n:frequencyGroups", ns)
-        if groups_el is not None:
-            for hjg in groups_el.findall("n:HeadwayJourneyGroup", ns):
+        if freq_groups is not None:
+            for hjg in freq_groups.findall("n:HeadwayJourneyGroup", ns):
                 headway = _duration_secs(_text(hjg.find("n:ScheduledHeadwayInterval", ns)))
                 start = _text(hjg.find("n:FirstDepartureTime", ns))
                 end = _text(hjg.find("n:LastDepartureTime", ns))
@@ -891,63 +1027,86 @@ class _Pass2:
                     "exact_times": int(exact) if exact else 0,
                 })
 
-        pt_container = sj.find("n:passingTimes", ns)
         if pt_container is not None:
             spi_to_stop = self.state.jp_spi_to_stop.get(jp_id, {}) if jp_id else {}
+            q_tpt = Q["TimetabledPassingTime"]
+            q_spi = Q["StopPointInJourneyPatternRef"]
+            q_arr, q_arr_off = Q["ArrivalTime"], Q["ArrivalDayOffset"]
+            q_dep, q_dep_off = Q["DepartureTime"], Q["DepartureDayOffset"]
 
             order = 0
-            for tpt in pt_container.findall("n:TimetabledPassingTime", ns):
-                stop_id = None
-                spi_ref = tpt.find("n:StopPointInJourneyPatternRef", ns)
-                if spi_ref is not None:
-                    spi_id = spi_ref.attrib.get("ref")
-                    stop_id = spi_to_stop.get(spi_id)
-
-                arr_time = None
-                arr_text = _text(tpt.find("n:ArrivalTime", ns))
-                if arr_text:
-                    arr_off_text = _text(tpt.find("n:ArrivalDayOffset", ns))
-                    arr_off = int(arr_off_text) if arr_off_text else 0
-                    arr_time = _reconstruct_time(arr_text, arr_off)
-
-                dep_time = None
-                dep_text = _text(tpt.find("n:DepartureTime", ns))
-                if dep_text:
-                    dep_off_text = _text(tpt.find("n:DepartureDayOffset", ns))
-                    dep_off = int(dep_off_text) if dep_off_text else 0
-                    dep_time = _reconstruct_time(dep_text, dep_off)
+            for tpt in pt_container:
+                if tpt.tag != q_tpt:
+                    continue
+                stop_id = pattern_order = None
+                arr_text = arr_off_text = dep_text = dep_off_text = None
+                for c in tpt:
+                    tag = c.tag
+                    if tag == q_spi:
+                        resolved = spi_to_stop.get(c.attrib.get("ref"))
+                        if resolved is not None:
+                            stop_id, pattern_order = resolved
+                    elif tag == q_arr:
+                        arr_text = _text(c)
+                    elif tag == q_arr_off:
+                        arr_off_text = _text(c)
+                    elif tag == q_dep:
+                        dep_text = _text(c)
+                    elif tag == q_dep_off:
+                        dep_off_text = _text(c)
 
                 if stop_id:
                     self.passing_times.append({
                         "service_journey_id": sjid,
                         "stop_point_id": stop_id,
-                        "order": order,
-                        "arrival_time": arr_time,
-                        "departure_time": dep_time,
+                        # Align with the pattern point's order so the two
+                        # sequences stay directly comparable (V16 invariant);
+                        # positional enumeration is the fallback.
+                        "order": pattern_order if pattern_order is not None else order,
+                        "arrival_time": _reconstruct_time(
+                            arr_text, int(arr_off_text) if arr_off_text else 0
+                        ) if arr_text else None,
+                        "departure_time": _reconstruct_time(
+                            dep_text, int(dep_off_text) if dep_off_text else 0
+                        ) if dep_text else None,
                     })
                 order += 1
-        else:
+        elif calls_el is not None:
             # Profiles without journey patterns (e.g. the Swiss SKI feeds) put
             # the stop sequence directly on the journey as calls/Call elements
             # with ScheduledStopPointRefs.
-            calls_el = sj.find("n:calls", ns)
-            if calls_el is not None:
-                order = 0
-                for call in calls_el.findall("n:Call", ns):
-                    ssp_ref = call.find("n:ScheduledStopPointRef", ns)
-                    stop_id = ssp_ref.attrib.get("ref") if ssp_ref is not None else None
-                    if stop_id and stop_id not in self.state.stop_ids:
-                        self.dropped_call_stops += 1
-                        stop_id = None
-                    if stop_id:
-                        self.passing_times.append({
-                            "service_journey_id": sjid,
-                            "stop_point_id": stop_id,
-                            "order": order,
-                            "arrival_time": self._call_time(call, "n:Arrival"),
-                            "departure_time": self._call_time(call, "n:Departure"),
-                        })
-                    order += 1
+            q_call = Q["Call"]
+            q_ssp = Q["ScheduledStopPointRef"]
+            q_arr_el, q_dep_el = Q["Arrival"], Q["Departure"]
+            q_time, q_off = Q["Time"], Q["DayOffset"]
+            stop_ids = self.state.stop_ids
+
+            order = 0
+            for call in calls_el:
+                if call.tag != q_call:
+                    continue
+                stop_id = arr_el = dep_el = None
+                for c in call:
+                    tag = c.tag
+                    if tag == q_ssp:
+                        if stop_id is None:
+                            stop_id = c.attrib.get("ref")
+                    elif tag == q_arr_el:
+                        arr_el = c
+                    elif tag == q_dep_el:
+                        dep_el = c
+                if stop_id and stop_id not in stop_ids:
+                    self.dropped_call_stops += 1
+                    stop_id = None
+                if stop_id:
+                    self.passing_times.append({
+                        "service_journey_id": sjid,
+                        "stop_point_id": stop_id,
+                        "order": order,
+                        "arrival_time": self._call_time(arr_el, q_time, q_off),
+                        "departure_time": self._call_time(dep_el, q_time, q_off),
+                    })
+                order += 1
 
         if len(self.passing_times) >= BATCH_SIZE or len(self.journeys) >= BATCH_SIZE:
             self.flush()

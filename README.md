@@ -325,6 +325,28 @@ print(report.to_markdown())
 
 The report provides both structured (`to_dict()`) and human-readable (`to_markdown()`) output, listing all passed checks and any issues found with their category, entity type, and ID.
 
+### Frequency Expansion & Compression
+
+Frequency-based feeds represent many departures with one template journey plus a
+`Frequency` window, which makes vehicle-hours and headway metrics undercount. Two
+inverse dataset operations bridge the representations:
+
+```python
+dataset.expand_frequencies()
+# {'frequencies_expanded': 12, 'journeys_created': 480, 'passing_times_created': 3360}
+
+dataset.compress_to_frequencies(min_run=3)
+# {'runs_compressed': 12, 'journeys_removed': 468, 'frequencies_created': 12}
+```
+
+`expand_frequencies()` materializes each window into concrete `ServiceJourney`s at
+`start, start+headway, … < end`, shifting the template's passing times — after
+which every operational statistic is computed over real departures.
+`compress_to_frequencies()` is the inverse: within each `(journey pattern, day
+type, timing profile)` class it finds maximal arithmetic departure runs and
+collapses each into a template plus a `Frequency`. `expand ∘ compress` reproduces
+the original departures exactly (lossless for `exact_times=1`).
+
 ### Incremental Updates
 
 Update individual entities without rewriting the full record:
@@ -379,6 +401,10 @@ pid-transit export --db city.db --format netex --output export.xml.gz --compress
 
 # Disable journey pattern deduplication
 pid-transit export --db city.db --format netex --output export.xml --no-dedup
+
+# Expand frequency windows into concrete journeys (or compress them back)
+pid-transit frequencies city.db --expand
+pid-transit frequencies city.db --compress --min-run 3
 
 # Run logical validation
 pid-transit validate city.db

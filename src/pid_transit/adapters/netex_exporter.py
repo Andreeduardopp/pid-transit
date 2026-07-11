@@ -43,6 +43,21 @@ def _wheelchair_to_access(value) -> str:
     return {1: "true", 2: "false"}.get(value, "unknown")
 
 
+# Internal TransportMode values whose NeTEx VehicleMode spelling differs.
+# Values not listed here (bus, tram, rail, metro, ferry, funicular, monorail)
+# are already valid NeTEx mode names and pass through unchanged.
+_INTERNAL_MODE_TO_NETEX = {
+    "trolleybus": "trolleyBus",
+    "cable_car": "cableway",
+    "gondola": "telecabin",
+    "other": "unknown",
+}
+
+
+def _netex_mode(mode: str) -> str:
+    return _INTERNAL_MODE_TO_NETEX.get(mode, mode)
+
+
 def _write_accessibility(parent: ET.Element, entity_id: str, wheelchair) -> None:
     if wheelchair not in (1, 2):
         return
@@ -77,36 +92,28 @@ class NetexExporter:
     def _build_pattern_dedup_map(self, db: TransmodelDatabase) -> dict:
         """Build a mapping from original JP ids to canonical JP ids.
 
-        Groups patterns by (line_id, direction, ordered stop sequence).
+        Groups patterns by (line_id, direction, ordered stop sequence) — the §2
+        quotient shared with ``TransitDataset.normalize_patterns()``.
         Returns {original_id: canonical_id} and the set of canonical IDs.
         """
-        patterns = db.get_records("journey_pattern")
-        points = db.get_records("point_in_journey_pattern")
-
-        points_by_pattern: dict = {}
-        for pt in points:
-            points_by_pattern.setdefault(pt["journey_pattern_id"], []).append(pt)
-
-        sig_to_canonical: dict = {}
-        remap: dict = {}
-
-        for jp in patterns:
-            jp_id = jp["id"]
-            pts = points_by_pattern.get(jp_id, [])
-            pts.sort(key=lambda p: p["order"])
-            stop_sig = tuple(p["stop_point_id"] for p in pts)
-            sig = (jp.get("line_id"), jp.get("direction"), stop_sig)
-
-            if sig not in sig_to_canonical:
-                sig_to_canonical[sig] = jp_id
-            remap[jp_id] = sig_to_canonical[sig]
-
-        canonical_ids = set(sig_to_canonical.values())
-        return remap, canonical_ids
+        from ..core.patterns import build_pattern_dedup_map
+        return build_pattern_dedup_map(db)
 
     def export_from_db(self, db: TransmodelDatabase, output_path: Union[Path, str]) -> None:
         logger.info("Exporting NeTEx to %s", output_path)
         if self.deduplicate_patterns:
+            # Precondition (formalization §4 V17): dedup collapses patterns by
+            # ordered stop sequence and assumes every journey follows its pattern.
+            # Journeys that violate this can be silently corrupted, so warn.
+            from ..core.patterns import find_pattern_violations
+            violations = find_pattern_violations(db)
+            if violations:
+                logger.warning(
+                    "deduplicate_patterns=True but %d service journey(s) do not "
+                    "follow their JourneyPattern stop sequence (V17); their "
+                    "geometry may be misrepresented after dedup. First offenders: %s",
+                    len(violations), ", ".join(sorted(violations)[:5]),
+                )
             self._jp_remap, self._canonical_jps = self._build_pattern_dedup_map(db)
         else:
             self._jp_remap = None
@@ -241,7 +248,7 @@ class NetexExporter:
                 ET.SubElement(el, "Name").text = line["name"]
                 if line.get("short_name"):
                     ET.SubElement(el, "ShortName").text = line["short_name"]
-                ET.SubElement(el, "TransportMode").text = line["transport_mode"]
+                ET.SubElement(el, "TransportMode").text = _netex_mode(line["transport_mode"])
                 if line.get("operator_id"):
                     ET.SubElement(el, "OperatorRef", attrib={
                         "ref": line["operator_id"], "version": "1"
@@ -411,6 +418,17 @@ class NetexExporter:
         for pts in pt_by_journey.values():
             pts.sort(key=lambda p: p["order"])
 
+        # Ordered StopPointInJourneyPattern ids per pattern, so a journey's
+        # k-th passing time can reference the pattern's k-th point. Matching
+        # positionally (not by the passing time's own `order` value) keeps the
+        # refs valid when the two order columns use different bases.
+        spi_ids_by_pattern: dict = {}
+        for pt in db.get_records("point_in_journey_pattern"):
+            spi_ids_by_pattern.setdefault(pt["journey_pattern_id"], []).append(
+                (pt["order"], f"{pt['journey_pattern_id']}_stop_{pt['order']}"))
+        for entries in spi_ids_by_pattern.values():
+            entries.sort()
+
         freq_by_journey: dict = {}
         for fr in db.get_records("frequency"):
             freq_by_journey.setdefault(fr["service_journey_id"], []).append(fr)
@@ -464,14 +482,16 @@ class NetexExporter:
 
                 sj_pts = pt_by_journey.get(sj["id"], [])
                 if sj_pts:
+                    spi_ids = [spi_id for _, spi_id
+                               in spi_ids_by_pattern.get(jp_id, [])]
                     pt_el = ET.SubElement(el, "passingTimes")
-                    for pt in sj_pts:
+                    for k, pt in enumerate(sj_pts):
                         tpt = ET.SubElement(pt_el, "TimetabledPassingTime", attrib={
                             "version": "0"
                         })
-                        if jp_id:
+                        if jp_id and k < len(spi_ids):
                             ET.SubElement(tpt, "StopPointInJourneyPatternRef", attrib={
-                                "ref": f"{jp_id}_stop_{pt['order']}",
+                                "ref": spi_ids[k],
                                 "version": "1",
                             })
                         if pt.get("arrival_time"):

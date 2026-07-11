@@ -87,6 +87,25 @@ This is a partition of $S_{\text{GTFS}}$ into two disjoint sets whose union is t
 whole; the GTFS exporter is the inverse merge that reattaches the correct
 `location_type`.
 
+### 1.3 NeTEx stop-coordinate resolution
+
+NeTEx keeps the timetable stop (`ScheduledStopPoint`, id $p$) separate from the
+physical geometry (`Quay`/`StopPlace`). The importer keys each stop by $p$ and
+resolves its site record — coordinates, name, accessibility — through an ordered
+list of candidate references, taking the **first that resolves** (Decision 3).
+Let $\alpha(p)$ be the `PassengerStopAssignment` target of $p$, $q(p)$ its own
+`QuayRef` attribute, and let $\text{site} = \text{Quay} \cup \text{StopPlace}$ be
+the resolvable site records. Define
+
+$$
+\text{resolve}(p) = \text{site}\bigl(\, \text{first}\langle \alpha(p),\, q(p),\, p \rangle \text{ that lies in } \operatorname{dom}\text{site} \,\bigr),
+$$
+
+falling back to $\varnothing$ if none resolves — in which case the stop is still
+created with $\varphi = \lambda = \varnothing$ (nullable since schema 3.1; see
+V10). When the feed defines no `ScheduledStopPoint` elements at all, the importer
+instead keys stops directly by `StopPlace` id.
+
 ---
 
 ## 2. Journey-Pattern Deduplication (Equivalence Relations & Quotients)
@@ -353,11 +372,18 @@ $$
 $$
 
 ### V10 — Coordinate plausibility *(warning)*
-Stop coordinates are neither at Null Island nor out of range:
+Stop coordinates are neither at Null Island nor out of range. Since schema 3.1
+$\varphi_s, \lambda_s$ are nullable (a stop whose coordinates the NeTEx importer
+could not resolve is stored with $\varphi_s = \lambda_s = \varnothing$); the
+validator coerces a missing coordinate to $0$ before the test, so the null-island
+clause also catches unresolved stops:
 
 $$
-\forall\, s \in S_{\text{stops}} :\ \neg\bigl(\varphi_s = 0 \wedge \lambda_s = 0\bigr)
-\ \wedge\ \lvert \varphi_s \rvert \le 90 \ \wedge\ \lvert \lambda_s \rvert \le 180 .
+\forall\, s \in S_{\text{stops}} :\
+\neg\bigl(\hat\varphi_s = 0 \wedge \hat\lambda_s = 0\bigr)
+\ \wedge\ \lvert \hat\varphi_s \rvert \le 90 \ \wedge\ \lvert \hat\lambda_s \rvert \le 180,
+\qquad
+\hat\varphi_s = \begin{cases}\varphi_s & \varphi_s \neq \varnothing \\ 0 & \text{otherwise}\end{cases}
 $$
 
 ### V12 — Feed date coverage *(info)*
@@ -367,6 +393,74 @@ $[\texttt{fi}_{\text{start}}, \texttt{fi}_{\text{end}}]$:
 $$
 \exists\, d \in D :\ \texttt{start\_date}(d) \le \texttt{fi}_{\text{end}}
 \ \wedge\ \texttt{end\_date}(d) \ge \texttt{fi}_{\text{start}} .
+$$
+
+### Semantic rules (V16–V20)
+
+V01–V15 guard *structural* integrity — references resolve, orders are unique,
+times are monotone. V16–V20 add *semantic* checks: data that is structurally
+valid yet operationally impossible.
+
+### V16 — Travel-speed plausibility *(warning / error)*
+For consecutive passing times $p_k, p_{k+1}$ of a journey $j$ on a line of mode
+$m$, with both stops carrying coordinates and separated by more than
+$\delta_{\min} = 50\,\text{m}$, the implied speed must lie below the per-mode
+ceiling $C(m)$ (bus $150$, tram/trolley $120$, rail $350$, … km/h; default
+$300$):
+
+$$
+v_k = \frac{d(\texttt{stop}(p_k), \texttt{stop}(p_{k+1}))}{\tau(t_{k+1}) - \tau(t_k)},
+\qquad
+d(\cdot) > \delta_{\min} \ \Rightarrow\ v_k \le C(m) .
+$$
+
+A zero or negative $\Delta\tau$ over a non-zero distance is a *warning*
+(teleport / division guard); exceeding $C(m)$ is an *error*. Pairs with a NULL
+coordinate on either endpoint are skipped (schema 3.1).
+
+### V17 — Pattern / passing-time consistency *(error)*
+A journey's realized stop sequence must equal its journey pattern's ordered
+points — the precondition that makes the §2 dedup quotient sound:
+
+$$
+\forall\, j \text{ with pattern } jp :\quad
+\bigl\langle \texttt{stop}(p) : p \in \Pi_j \text{ ordered} \bigr\rangle = \sigma(jp) .
+$$
+
+The NeTEx exporter checks this before deduplicating and warns on violators,
+since collapsing a violating journey onto a canonical pattern with a different
+order silently corrupts its geometry.
+
+### V18 — Duplicate-stop detection *(warning)*
+Two stops with the same normalized name lying within $\delta_{\text{dup}} = 10\,\text{m}$
+are probable duplicates (reuses the Haversine helper of §3.5):
+
+$$
+\texttt{norm}(\texttt{name}(s_1)) = \texttt{norm}(\texttt{name}(s_2))
+\ \wedge\ d(s_1, s_2) \le \delta_{\text{dup}}
+\ \Rightarrow\ \text{duplicate}(s_1, s_2) .
+$$
+
+### V19 — Unused entities *(info)*
+Orphan inventory over stops, patterns, day types, and shapes — harmless but
+export bloat and usually an upstream bug. E.g. for stops:
+
+$$
+s \in S_{\text{stops}} \ \wedge\
+s \notin \bigl(\{\texttt{stop}(p) : p \in \Pi\} \cup \{\texttt{stop}(p) : p \in \mathit{PIJP}\}\bigr)
+\ \Rightarrow\ \text{unused}(s),
+$$
+
+and analogously for a pattern with no journey, a day type with no journey and no
+exception, and a shape no journey references.
+
+### V20 — Frequency sanity *(warning)*
+Each frequency window is well-formed and windows of one journey do not overlap:
+
+$$
+\forall\, f \in F :\ \tau(\texttt{start}(f)) < \tau(\texttt{end}(f)) \ \wedge\ \texttt{headway}(f) > 0,
+\qquad
+\forall\, f, f' \in F_j :\ [\,\tau(\texttt{start}(f)), \tau(\texttt{end}(f))\,) \cap [\,\tau(\texttt{start}(f')), \tau(\texttt{end}(f'))\,) = \varnothing .
 $$
 
 ---

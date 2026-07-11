@@ -76,6 +76,8 @@ Keeping them separate means:
 - The NeTEx exporter can emit proper `StopPlace` elements (in `SiteFrame`) and `ScheduledStopPoint` references (in `ServiceFrame`) without guessing
 - The hierarchy (stop → station → entrance → level) is modeled through `StopArea.parent_id` and `StopArea.level_id` foreign keys
 
+**NeTEx import — stops are keyed by `ScheduledStopPoint`, not `StopPlace`.** On real feeds the timetable references `ScheduledStopPointRef`, while coordinates and names live on separate `StopPlace`/`Quay` infrastructure. The importer therefore keys each stop by its SSP id and resolves geometry through a fallback chain: `PassengerStopAssignment` → `Quay` (preferred) or `StopPlace`, then the SSP's own `QuayRef` attribute, then a `StopPlace` sharing the SSP id (the round-trip case, since our exporter emits that attribute). Feeds with no SSP elements fall back to importing `StopPlace`s directly. When no coordinate can be resolved the stop is still imported with NULL lat/lon (see Decision 8) and a warning is logged.
+
 ---
 
 ## Decision 4: Synthetic JourneyPatterns from GTFS Trips
@@ -94,6 +96,8 @@ The redundancy is resolved at export time: the NeTEx exporter has an optional `d
 - **Import is lossless:** every GTFS trip's stop sequence is preserved exactly
 - **Export is clean:** NeTEx output isn't bloated with thousands of identical patterns
 - **The database can hold both:** native NeTEx patterns (imported as-is) and synthetic GTFS patterns coexist
+
+**NeTEx import — patternless journeys.** Not every NeTEx feed uses patterns. Swiss SKI-profile `ServiceJourney`s carry their stop sequence inline as `calls/Call` elements with direct `ScheduledStopPointRef`s and no `JourneyPattern` at all. The importer synthesizes a JourneyPattern (and its `PointInJourneyPattern` rows) from the calls, mirroring the GTFS side. Related normalizations on real feeds: `ServiceJourneyPattern` is treated as a `JourneyPattern`, and a pattern's `RouteRef` — which names a `Route`, not a `Line` — is resolved to its line through `Route.LineRef`.
 
 ---
 
@@ -123,7 +127,7 @@ The `_reconstruct_time()` function (NeTEx import) and `_normalize_time()` functi
 **Why:** GTFS and NeTEx represent service calendars differently:
 
 - **GTFS:** `calendar.txt` has boolean columns (`monday=1, tuesday=1, ...`) with `start_date`/`end_date`
-- **NeTEx:** `DayType` elements contain `PropertyOfDay` with a space-separated string like `"Monday Tuesday Wednesday"`
+- **NeTEx:** `DayType` elements contain `PropertyOfDay` with a space-separated string like `"Monday Tuesday Wednesday"`, and validity is carried by `ValidBetween` / `DayTypeAssignment` (with `OperatingPeriod` / `UicOperatingPeriod`)
 
 The boolean-flag model was chosen because:
 
@@ -133,6 +137,8 @@ The boolean-flag model was chosen because:
 - The `OperatingDayException` table handles both GTFS `calendar_dates.txt` and NeTEx operating day exceptions
 
 **Edge case — missing calendars:** Some GTFS feeds define service only through `calendar_dates.txt` without corresponding `calendar.txt` entries. The importer handles this by creating placeholder DayTypes with all days set to `False` and the date range derived from the exception dates.
+
+**Edge case — NeTEx `AvailabilityCondition` calendars:** The Swiss SKI profile (and similar national feeds) express service not as `DayType` day-name strings but as `AvailabilityCondition`s — a `FromDate` plus a `ValidDayBits` bitmask — referenced from a journey's `validityConditions`. The importer maps each such condition to an all-`False` DayType plus one `OperatingDayException` per set bit in the bitmask, reusing the same exception machinery as `calendar_dates.txt`.
 
 ---
 
@@ -155,9 +161,24 @@ The boolean-flag model was chosen because:
 **Why:**
 
 - **Portable:** single-file database, no server process, works everywhere
-- **Referential integrity catches errors early:** a `ServiceJourney` referencing a nonexistent `DayType` fails at insert time, not at export time when it's harder to diagnose
+- **Referential integrity catches errors early:** a `ServiceJourney` referencing a nonexistent `DayType` fails at insert time, not at export time when it's harder to diagnose (on real feeds, genuinely dangling references — a line/stop/day type the feed never defines — are skipped or nulled with a warning rather than aborting a whole insert batch)
 - **In-memory mode:** used for testing and ephemeral operations (import → transform → export pipelines)
-- **Schema versioning:** the `_meta` table tracks `schema_version = "3.0.0-transmodel"` and the database auto-migrates on open
+- **Schema versioning:** the `_meta` table tracks `schema_version = "3.1.0-transmodel"` and the database auto-migrates on open. The `3.0 → 3.1` migration made `scheduled_stop_point.lat/lon` nullable (rebuilding the table) so stops with no resolvable coordinates can be imported instead of dropped
+- **Bulk-write path for imports:** `bulk_session()` pins one connection for the run with `journal_mode=WAL` / `synchronous=NORMAL` (file DBs), and `upsert()` uses a single prepared `INSERT OR REPLACE` + `executemany` per batch, with an optional `validate=False` fast path for adapter-built rows
+
+---
+
+## Decision 9: Streaming, Multi-File NeTEx Import
+
+**Choice:** Import NeTEx by streaming the XML with a two-pass `iterparse` (pruning parsed elements) rather than loading whole documents into memory, and accept a single file, a directory, a `.zip`, or a list of paths as one logical feed.
+
+**Why:** Production NeTEx feeds are large and split across many files. The Swiss national timetable is 355 files / ~4 GB of XML; loading it as a DOM is not viable, and its cross-file references mean file order can't be assumed.
+
+- **Two passes.** Pass 1 sweeps *all* files collecting reference data (operators, lines, routes, stops/assignments, day types, patterns). Pass 2 then streams `ServiceJourney`s, so a journey can always resolve references defined in any other file. Parsed elements are pruned (`del parent[-1]`) to keep peak memory flat — the just-ended element is always its parent's last child, so pruning is O(1).
+- **Any source shape.** A directory, a zip (members are streamed, never extracted to disk), or an explicit path list all import as one feed.
+- **Client-friendly.** The importer accepts `on_progress(entity_type, count, *, file_index, total_files)` (fired per batch flush with cumulative counts — SSE-friendly) and a `cancel_event` (`threading.Event`) that aborts cleanly between batches with `ImportCancelledError`, rolling back the in-flight transaction. `GtfsImporter` exposes the same hooks.
+
+The result: the Swiss feed imports with ~1.25 GB peak RSS (down from loading everything), where the previous DOM-based importer produced zero passing times on it. See [`../IMPROVEMENTS.md`](../IMPROVEMENTS.md) for benchmark detail.
 
 ---
 
@@ -177,14 +198,16 @@ The boolean-flag model was chosen because:
 | PassingTime | `stop_times.txt` | `TimetabledPassingTime` |
 | Level | `levels.txt` | — |
 | Pathway | `pathways.txt` | — |
-| ShapePoint | `shapes.txt` | — |
-| Frequency | `frequencies.txt` | — |
-| Transfer | `transfers.txt` | — |
+| ShapePoint | `shapes.txt` | `LinkSequenceProjection` + `gml:posList` (per JourneyPattern) |
+| Frequency | `frequencies.txt` | `TemplateServiceJourney` + `HeadwayJourneyGroup` |
+| Transfer | `transfers.txt` | `Connection` + `WalkTransferDuration` |
 | FareAttribute | `fare_attributes.txt` | — |
 | FareRule | `fare_rules.txt` | — |
 | Translation | `translations.txt` | — |
 | FeedInfo | `feed_info.txt` | Feed metadata |
 | Attribution | `attributions.txt` | — |
+
+Shapes, frequencies, and transfers now round-trip through NeTEx in **both** directions (import and export), not just to GTFS. Wheelchair accessibility maps to `AccessibilityAssessment` / `MobilityImpairedAccess` on `StopPlace`, `Quay`, and `ServiceJourney`. `bikes_allowed` has no clean NeTEx home and stays GTFS-only.
 
 ---
 
@@ -202,9 +225,9 @@ The boolean-flag model was chosen because:
 
 ### NeTEx → Database → GTFS
 
-1. `NetexImporter` parses XML, detecting the NeTEx namespace automatically
-2. `StopPlace` coordinates (from `Centroid/Location`) → `ScheduledStopPoint` records
-3. `DayType` day-of-week strings are parsed into boolean flags
-4. `TimetabledPassingTime` offsets are reconstructed: `01:30:00 + DayOffset=1` → `25:30:00`
-5. JourneyPatterns and their `pointsInSequence` are preserved directly (no synthesis needed)
+1. `NetexImporter` streams the source (file / directory / zip / path list), detecting the NeTEx namespace automatically. Pass 1 collects reference data from every file
+2. Stops are keyed by `ScheduledStopPoint` id; coordinates and names are resolved through `PassengerStopAssignment` → `Quay`/`StopPlace` (with `QuayRef`-attribute and same-id fallbacks). Unresolvable coordinates are stored as NULL
+3. Calendars are parsed from `DayType` day-of-week strings **or**, on profiles that use them, from `AvailabilityCondition` bitmasks (all-false DayType + one exception per set bit)
+4. Pass 2 streams `ServiceJourney`s: `TimetabledPassingTime` offsets are reconstructed (`01:30:00 + DayOffset=1` → `25:30:00`), batches flush every 5,000 rows
+5. Journeys with a `JourneyPattern` reuse its `pointsInSequence` directly; patternless journeys (inline `calls/Call`) get a synthesized pattern
 6. On GTFS export, Transmodel entities are mapped back to the flat CSV structure

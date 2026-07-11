@@ -7,15 +7,39 @@ Validates the logical consistency of the TransmodelDatabase data.
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Dict, Set
+from typing import List, Dict, Optional, Set
 
 from .database import TransmodelDatabase
+from .geo import StopGrid, haversine
+from .schemas import TransportMode
 
 
 class Severity(str, Enum):
     ERROR = "error"
     WARNING = "warning"
     INFO = "info"
+
+
+# Ordering for --min-severity filtering (higher = more severe).
+_SEVERITY_RANK = {Severity.INFO: 0, Severity.WARNING: 1, Severity.ERROR: 2}
+
+# V16: hard per-mode implied-speed ceilings (km/h). Above these a pair of
+# consecutive passing times is physically implausible and flagged as an error.
+_SPEED_CEILING_KMH = {
+    TransportMode.BUS: 150,
+    TransportMode.TROLLEYBUS: 120,
+    TransportMode.TRAM: 120,
+    TransportMode.METRO: 150,
+    TransportMode.RAIL: 350,
+    TransportMode.MONORAIL: 150,
+    TransportMode.FERRY: 100,
+    TransportMode.CABLE_CAR: 60,
+    TransportMode.GONDOLA: 60,
+    TransportMode.FUNICULAR: 60,
+}
+_SPEED_CEILING_DEFAULT_KMH = 300
+# Below this separation, coordinate noise dominates, so V16 skips the pair.
+_MIN_SPEED_DISTANCE_M = 50.0
 
 
 @dataclass
@@ -46,8 +70,16 @@ def _time_to_secs(t: str) -> int:
     return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
 
 
-def validate_transmodel(db: TransmodelDatabase) -> ValidationReport:
-    """Run logical validation on the Transmodel data."""
+def validate_transmodel(
+    db: TransmodelDatabase, min_severity: Severity = Severity.INFO
+) -> ValidationReport:
+    """Run logical validation on the Transmodel data.
+
+    Rules V01–V15 cover structural integrity; V16–V20 add *semantic* checks
+    (formalization.md §4) — data that is structurally valid yet operationally
+    impossible. ``min_severity`` filters the returned issues (errors are always
+    kept); ``is_valid`` reflects errors regardless of the filter.
+    """
     report = ValidationReport()
 
     journeys = db.get_records("service_journey")
@@ -262,5 +294,188 @@ def validate_transmodel(db: TransmodelDatabase) -> ValidationReport:
                 issue_type="orphan_pattern_reference",
                 message=f"ServiceJourney {sj['id']} references non-existent JourneyPattern {jp_id}.",
             ))
+
+    # Shared lookups for the semantic rules below.
+    stop_coords: Dict[str, tuple] = {
+        s["id"]: (s.get("lat"), s.get("lon")) for s in stops
+    }
+    line_mode: Dict[str, str] = {ln["id"]: ln.get("transport_mode") for ln in lines}
+    pijp = db.get_records("point_in_journey_pattern")
+
+    # --- V16: Travel-speed plausibility (§3.5 Haversine over consecutive stops) ---
+    # Journeys share patterns, so the same consecutive stop pair recurs across
+    # thousands of journeys; memoize its distance instead of re-deriving it.
+    pair_dist: Dict[tuple, Optional[float]] = {}
+    for sj in journeys:
+        pts = sorted(pt_by_journey.get(sj["id"], []), key=lambda x: x["order"])
+        ceiling = _SPEED_CEILING_KMH.get(line_mode.get(sj["line_id"]),
+                                         _SPEED_CEILING_DEFAULT_KMH)
+        for a, b in zip(pts, pts[1:]):
+            pair = (a["stop_point_id"], b["stop_point_id"])
+            dist = pair_dist.get(pair, -1.0)
+            if dist == -1.0:
+                la, loa = stop_coords.get(pair[0], (None, None))
+                lb, lob = stop_coords.get(pair[1], (None, None))
+                # None marks a pair unusable (schema 3.1 allows NULL coordinates)
+                dist = (None if None in (la, loa, lb, lob)
+                        else haversine(la, loa, lb, lob))
+                pair_dist[pair] = dist
+            if dist is None:
+                continue
+            if dist < _MIN_SPEED_DISTANCE_M:
+                continue
+            t1 = a.get("departure_time") or a.get("arrival_time")
+            t2 = b.get("arrival_time") or b.get("departure_time")
+            if not (t1 and _TIME_RE.match(t1) and t2 and _TIME_RE.match(t2)):
+                continue
+            dt = _time_to_secs(t2) - _time_to_secs(t1)
+            if dt <= 0:
+                report._append(ValidationIssue(
+                    entity_type="service_journey",
+                    entity_id=f"{sj['id']}@order={b['order']}",
+                    issue_type="implausible_speed",
+                    message=(f"Journey {sj['id']} covers {dist:.0f} m between stops "
+                             f"{a['stop_point_id']} and {b['stop_point_id']} in "
+                             f"{dt} s (zero/negative time)."),
+                    severity=Severity.WARNING,
+                ))
+                continue
+            speed_kmh = dist / dt * 3.6
+            if speed_kmh > ceiling:
+                report._append(ValidationIssue(
+                    entity_type="service_journey",
+                    entity_id=f"{sj['id']}@order={b['order']}",
+                    issue_type="implausible_speed",
+                    message=(f"Journey {sj['id']} implies {speed_kmh:.0f} km/h between "
+                             f"stops {a['stop_point_id']} and {b['stop_point_id']} "
+                             f"(ceiling {ceiling} km/h)."),
+                ))
+
+    # --- V17: Pattern / passing-time consistency ---
+    # The invariant that makes §2 pattern dedup safe: a journey's stop sequence
+    # must equal its journey pattern's ordered points. Shares one implementation
+    # with the NeTEx exporter's dedup guard (core.patterns.find_pattern_violations).
+    from .patterns import find_pattern_violations
+    violations = find_pattern_violations(db)
+    for sj in journeys:
+        if sj["id"] in violations:
+            report._append(ValidationIssue(
+                entity_type="service_journey",
+                entity_id=sj["id"],
+                issue_type="pattern_sequence_mismatch",
+                message=(f"Journey {sj['id']} stop sequence does not match its "
+                         f"JourneyPattern {sj.get('journey_pattern_id')}."),
+            ))
+
+    # --- V18: Duplicate-stop detection (same normalized name within 10 m) ---
+    named: Dict[str, List[dict]] = {}
+    for s in stops:
+        if s.get("lat") is None or s.get("lon") is None:
+            continue
+        named.setdefault((s.get("name") or "").strip().lower(), []).append(s)
+    for group in named.values():
+        # StopGrid keeps a group of k same-named stops at O(k·neighbors)
+        # instead of the k²/2 all-pairs scan (degenerate when a feed has many
+        # unnamed stops: they all share the "" key).
+        grid = StopGrid(((s["id"], s["lat"], s["lon"]) for s in group), cell_m=10.0)
+        pos = {s["id"]: i for i, s in enumerate(group)}
+        for s in group:
+            for other_id, d in grid.within(s["lat"], s["lon"], 10.0):
+                if pos[other_id] >= pos[s["id"]]:
+                    continue  # report each pair once, later stop as duplicate
+                report._append(ValidationIssue(
+                    entity_type="scheduled_stop_point",
+                    entity_id=s["id"],
+                    issue_type="duplicate_stop",
+                    message=(f"Stop {s['id']} duplicates {other_id} "
+                             f"(same name within {d:.0f} m)."),
+                    severity=Severity.WARNING,
+                ))
+
+    # --- V19: Unused entities (orphan inventory) ---
+    referenced_stops = {pt["stop_point_id"] for pt in passing_times}
+    referenced_stops |= {p["stop_point_id"] for p in pijp}
+    for s in stops:
+        if s["id"] not in referenced_stops:
+            report._append(ValidationIssue(
+                entity_type="scheduled_stop_point",
+                entity_id=s["id"],
+                issue_type="unused_stop",
+                message=f"Stop {s['id']} is never used by any journey or pattern.",
+                severity=Severity.INFO,
+            ))
+    used_patterns = {sj.get("journey_pattern_id") for sj in journeys}
+    for p in patterns:
+        if p["id"] not in used_patterns:
+            report._append(ValidationIssue(
+                entity_type="journey_pattern",
+                entity_id=p["id"],
+                issue_type="unused_pattern",
+                message=f"JourneyPattern {p['id']} has no ServiceJourneys.",
+                severity=Severity.INFO,
+            ))
+    used_day_types = {sj["day_type_id"] for sj in journeys}
+    used_day_types |= {exc["day_type_id"] for exc in exceptions}
+    for dt in day_types:
+        if dt["id"] not in used_day_types:
+            report._append(ValidationIssue(
+                entity_type="day_type",
+                entity_id=dt["id"],
+                issue_type="unused_day_type",
+                message=f"DayType {dt['id']} has no journeys and no exceptions.",
+                severity=Severity.INFO,
+            ))
+    referenced_shapes = {sj.get("shape_id") for sj in journeys if sj.get("shape_id")}
+    shape_ids = {sp["shape_id"] for sp in db.get_records("shape_point")}
+    for shape_id in shape_ids - referenced_shapes:
+        report._append(ValidationIssue(
+            entity_type="shape_point",
+            entity_id=shape_id,
+            issue_type="unused_shape",
+            message=f"Shape {shape_id} is never referenced by a ServiceJourney.",
+            severity=Severity.INFO,
+        ))
+
+    # --- V20: Frequency sanity ---
+    freq_by_journey: Dict[str, List[dict]] = {}
+    for fr in frequencies:
+        start, end = fr.get("start_time"), fr.get("end_time")
+        if start and end and _TIME_RE.match(start) and _TIME_RE.match(end):
+            if _time_to_secs(start) >= _time_to_secs(end):
+                report._append(ValidationIssue(
+                    entity_type="frequency",
+                    entity_id=f"{fr['service_journey_id']}@{start}",
+                    issue_type="frequency_window",
+                    message=f"Frequency window {start}-{end} is empty or reversed.",
+                    severity=Severity.WARNING,
+                ))
+            freq_by_journey.setdefault(fr["service_journey_id"], []).append(fr)
+        if fr.get("headway_secs") is not None and fr["headway_secs"] <= 0:
+            report._append(ValidationIssue(
+                entity_type="frequency",
+                entity_id=f"{fr['service_journey_id']}@{fr.get('start_time')}",
+                issue_type="frequency_headway",
+                message=f"Frequency has non-positive headway {fr['headway_secs']}s.",
+                severity=Severity.WARNING,
+            ))
+    for sj_id, frs in freq_by_journey.items():
+        ordered = sorted(frs, key=lambda f: _time_to_secs(f["start_time"]))
+        for prev, cur in zip(ordered, ordered[1:]):
+            if _time_to_secs(cur["start_time"]) < _time_to_secs(prev["end_time"]):
+                report._append(ValidationIssue(
+                    entity_type="frequency",
+                    entity_id=f"{sj_id}@{cur['start_time']}",
+                    issue_type="frequency_overlap",
+                    message=(f"Frequency windows overlap for journey {sj_id} "
+                             f"({prev['start_time']}-{prev['end_time']} and "
+                             f"{cur['start_time']}-{cur['end_time']})."),
+                    severity=Severity.WARNING,
+                ))
+
+    if min_severity != Severity.INFO:
+        threshold = _SEVERITY_RANK[min_severity]
+        report.issues = [
+            i for i in report.issues if _SEVERITY_RANK[i.severity] >= threshold
+        ]
 
     return report

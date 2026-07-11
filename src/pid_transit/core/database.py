@@ -16,7 +16,7 @@ from .schemas import TRANSMODEL_ENTITIES
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "3.1.0-transmodel"
+SCHEMA_VERSION = "3.2.0-transmodel"
 
 _TABLE_SCHEMAS = {
     "operator": """
@@ -26,7 +26,8 @@ _TABLE_SCHEMAS = {
             url      TEXT,
             timezone TEXT NOT NULL,
             lang     TEXT,
-            phone    TEXT
+            phone    TEXT,
+            extras   TEXT
         )
     """,
     "line": """
@@ -36,7 +37,12 @@ _TABLE_SCHEMAS = {
             name           TEXT NOT NULL,
             short_name     TEXT,
             transport_mode TEXT NOT NULL,
-            color          TEXT
+            color          TEXT,
+            text_color     TEXT,
+            description    TEXT,
+            url            TEXT,
+            sort_order     INTEGER,
+            extras         TEXT
         )
     """,
     "scheduled_stop_point": """
@@ -46,14 +52,20 @@ _TABLE_SCHEMAS = {
             lat                 REAL,
             lon                 REAL,
             stop_area_id        TEXT,
-            wheelchair_boarding INTEGER
+            wheelchair_boarding INTEGER,
+            code                TEXT,
+            platform_code       TEXT,
+            zone_id             TEXT,
+            description         TEXT,
+            extras              TEXT
         )
     """,
     "level": """
         CREATE TABLE IF NOT EXISTS level (
             id    TEXT PRIMARY KEY,
             "index" REAL NOT NULL,
-            name  TEXT
+            name  TEXT,
+            extras TEXT
         )
     """,
     "stop_area": """
@@ -65,7 +77,8 @@ _TABLE_SCHEMAS = {
             location_type       INTEGER NOT NULL DEFAULT 1,
             parent_id           TEXT,
             level_id            TEXT REFERENCES level(id),
-            wheelchair_boarding INTEGER
+            wheelchair_boarding INTEGER,
+            extras              TEXT
         )
     """,
     "pathway": """
@@ -81,7 +94,8 @@ _TABLE_SCHEMAS = {
             max_slope              REAL,
             min_width              REAL,
             signposted_as          TEXT,
-            reversed_signposted_as TEXT
+            reversed_signposted_as TEXT,
+            extras                 TEXT
         )
     """,
     "day_type": """
@@ -95,7 +109,8 @@ _TABLE_SCHEMAS = {
             saturday   INTEGER NOT NULL,
             sunday     INTEGER NOT NULL,
             start_date TEXT NOT NULL,
-            end_date   TEXT NOT NULL
+            end_date   TEXT NOT NULL,
+            extras     TEXT
         )
     """,
     "operating_day_exception": """
@@ -103,6 +118,7 @@ _TABLE_SCHEMAS = {
             day_type_id TEXT NOT NULL REFERENCES day_type(id),
             date        TEXT NOT NULL,
             is_addition INTEGER NOT NULL,
+            extras      TEXT,
             PRIMARY KEY (day_type_id, date)
         )
     """,
@@ -110,7 +126,8 @@ _TABLE_SCHEMAS = {
         CREATE TABLE IF NOT EXISTS journey_pattern (
             id        TEXT PRIMARY KEY,
             line_id   TEXT NOT NULL REFERENCES line(id),
-            direction TEXT
+            direction TEXT,
+            extras    TEXT
         )
     """,
     "point_in_journey_pattern": """
@@ -118,6 +135,7 @@ _TABLE_SCHEMAS = {
             journey_pattern_id TEXT NOT NULL REFERENCES journey_pattern(id),
             stop_point_id      TEXT NOT NULL REFERENCES scheduled_stop_point(id),
             "order"            INTEGER NOT NULL,
+            extras             TEXT,
             PRIMARY KEY (journey_pattern_id, "order")
         )
     """,
@@ -130,16 +148,26 @@ _TABLE_SCHEMAS = {
             departure_time        TEXT NOT NULL,
             wheelchair_accessible INTEGER,
             bikes_allowed         INTEGER,
-            shape_id              TEXT
+            shape_id              TEXT,
+            headsign              TEXT,
+            short_name            TEXT,
+            block_id              TEXT,
+            extras                TEXT
         )
     """,
     "passing_time": """
         CREATE TABLE IF NOT EXISTS passing_time (
-            service_journey_id TEXT NOT NULL REFERENCES service_journey(id),
-            stop_point_id      TEXT NOT NULL REFERENCES scheduled_stop_point(id),
-            "order"            INTEGER NOT NULL,
-            arrival_time       TEXT,
-            departure_time     TEXT,
+            service_journey_id  TEXT NOT NULL REFERENCES service_journey(id),
+            stop_point_id       TEXT NOT NULL REFERENCES scheduled_stop_point(id),
+            "order"             INTEGER NOT NULL,
+            arrival_time        TEXT,
+            departure_time      TEXT,
+            pickup_type         INTEGER,
+            drop_off_type       INTEGER,
+            timepoint           INTEGER,
+            stop_headsign       TEXT,
+            shape_dist_traveled REAL,
+            extras              TEXT,
             PRIMARY KEY (service_journey_id, "order")
         )
     """,
@@ -153,7 +181,8 @@ _TABLE_SCHEMAS = {
             end_date        TEXT,
             version         TEXT,
             contact_email   TEXT,
-            contact_url     TEXT
+            contact_url     TEXT,
+            extras          TEXT
         )
     """,
     "shape_point": """
@@ -163,6 +192,7 @@ _TABLE_SCHEMAS = {
             lon           REAL NOT NULL,
             sequence      INTEGER NOT NULL,
             dist_traveled REAL,
+            extras        TEXT,
             PRIMARY KEY (shape_id, sequence)
         )
     """,
@@ -173,6 +203,7 @@ _TABLE_SCHEMAS = {
             end_time           TEXT NOT NULL,
             headway_secs       INTEGER NOT NULL,
             exact_times        INTEGER DEFAULT 0,
+            extras             TEXT,
             PRIMARY KEY (service_journey_id, start_time)
         )
     """,
@@ -182,6 +213,7 @@ _TABLE_SCHEMAS = {
             to_stop_id        TEXT NOT NULL REFERENCES scheduled_stop_point(id),
             transfer_type     INTEGER NOT NULL DEFAULT 0,
             min_transfer_time INTEGER,
+            extras            TEXT,
             PRIMARY KEY (from_stop_id, to_stop_id)
         )
     """,
@@ -193,7 +225,8 @@ _TABLE_SCHEMAS = {
             payment_method    INTEGER NOT NULL,
             transfers         INTEGER,
             operator_id       TEXT REFERENCES operator(id),
-            transfer_duration INTEGER
+            transfer_duration INTEGER,
+            extras            TEXT
         )
     """,
     "fare_rule": """
@@ -203,6 +236,7 @@ _TABLE_SCHEMAS = {
             origin_id      TEXT NOT NULL DEFAULT '',
             destination_id TEXT NOT NULL DEFAULT '',
             contains_id    TEXT NOT NULL DEFAULT '',
+            extras         TEXT,
             PRIMARY KEY (fare_id, route_id, origin_id, destination_id, contains_id)
         )
     """,
@@ -215,6 +249,7 @@ _TABLE_SCHEMAS = {
             record_id    TEXT NOT NULL DEFAULT '',
             record_sub_id TEXT NOT NULL DEFAULT '',
             field_value  TEXT NOT NULL DEFAULT '',
+            extras       TEXT,
             PRIMARY KEY (table_name, field_name, language, record_id, field_value)
         )
     """,
@@ -227,7 +262,8 @@ _TABLE_SCHEMAS = {
             is_authority       INTEGER,
             attribution_url    TEXT,
             attribution_email  TEXT,
-            attribution_phone  TEXT
+            attribution_phone  TEXT,
+            extras             TEXT
         )
     """,
     "_meta": """
@@ -236,6 +272,39 @@ _TABLE_SCHEMAS = {
             value TEXT
         )
     """
+}
+
+# Secondary (foreign-key) indexes. Composite primary keys already index their
+# leftmost column (passing_time.service_journey_id, point_in_journey_pattern
+# .journey_pattern_id, etc.), so only lookups NOT covered by a PK prefix are
+# listed here. Dropped and rebuilt around bulk imports (load-then-index).
+_INDEX_SCHEMAS = {
+    "idx_sj_line":      "CREATE INDEX IF NOT EXISTS idx_sj_line      ON service_journey(line_id)",
+    "idx_sj_day_type":  "CREATE INDEX IF NOT EXISTS idx_sj_day_type  ON service_journey(day_type_id)",
+    "idx_sj_pattern":   "CREATE INDEX IF NOT EXISTS idx_sj_pattern   ON service_journey(journey_pattern_id)",
+    "idx_jp_line":      "CREATE INDEX IF NOT EXISTS idx_jp_line      ON journey_pattern(line_id)",
+    "idx_line_op":      "CREATE INDEX IF NOT EXISTS idx_line_op      ON line(operator_id)",
+    "idx_pt_stop":      "CREATE INDEX IF NOT EXISTS idx_pt_stop      ON passing_time(stop_point_id)",
+    "idx_pijp_stop":    "CREATE INDEX IF NOT EXISTS idx_pijp_stop    ON point_in_journey_pattern(stop_point_id)",
+    "idx_ssp_area":     "CREATE INDEX IF NOT EXISTS idx_ssp_area     ON scheduled_stop_point(stop_area_id)",
+    "idx_sa_parent":    "CREATE INDEX IF NOT EXISTS idx_sa_parent    ON stop_area(parent_id)",
+    "idx_transfer_to":  "CREATE INDEX IF NOT EXISTS idx_transfer_to  ON transfer(to_stop_id)",
+    "idx_pathway_from": "CREATE INDEX IF NOT EXISTS idx_pathway_from ON pathway(from_stop_id)",
+    "idx_pathway_to":   "CREATE INDEX IF NOT EXISTS idx_pathway_to   ON pathway(to_stop_id)",
+}
+
+# Columns added by the 3.2 migration (Task 1 field gaps + extras everywhere).
+# Applied idempotently via ALTER TABLE ADD COLUMN when a column is missing.
+_MIGRATION_COLUMNS = {
+    "line": {"text_color": "TEXT", "description": "TEXT", "url": "TEXT",
+             "sort_order": "INTEGER"},
+    "scheduled_stop_point": {"code": "TEXT", "platform_code": "TEXT",
+                             "zone_id": "TEXT", "description": "TEXT"},
+    "service_journey": {"headsign": "TEXT", "short_name": "TEXT",
+                        "block_id": "TEXT"},
+    "passing_time": {"pickup_type": "INTEGER", "drop_off_type": "INTEGER",
+                     "timepoint": "INTEGER", "stop_headsign": "TEXT",
+                     "shape_dist_traveled": "REAL"},
 }
 
 class TransmodelDatabase:
@@ -268,6 +337,23 @@ class TransmodelDatabase:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def close(self) -> None:
+        """Release any held connection.
+
+        File-backed databases open and close a connection per call, so there is
+        usually nothing pinned; this closes the persistent in-memory connection
+        and any active bulk-session connection so the OS file handle is released
+        deterministically (matters on Windows, where an open handle blocks
+        deleting the .db file)."""
+        if self._session_conn is not None:
+            try:
+                self._session_conn.close()
+            finally:
+                self._session_conn = None
+        if self._in_memory and self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
     def _release(self, conn: sqlite3.Connection) -> None:
         """Close a connection obtained from connect(), unless it is shared
         (the in-memory connection or an active bulk session)."""
@@ -297,6 +383,10 @@ class TransmodelDatabase:
         conn.row_factory = sqlite3.Row
         self._session_conn = conn
         try:
+            # Load-then-index: maintaining secondary indexes row-by-row is
+            # slower than rebuilding them over the loaded tables afterwards.
+            for name in _INDEX_SCHEMAS:
+                conn.execute(f"DROP INDEX IF EXISTS {name}")
             yield conn
             self._touch_last_modified(conn)
             conn.commit()
@@ -304,6 +394,14 @@ class TransmodelDatabase:
             conn.rollback()
             raise
         finally:
+            try:
+                # Rebuild even after a rollback; a missing index is also
+                # self-healed by _ensure_schema on the next open.
+                for ddl in _INDEX_SCHEMAS.values():
+                    conn.execute(ddl)
+                conn.commit()
+            except sqlite3.Error:
+                logger.warning("Could not rebuild indexes after bulk session")
             self._session_conn = None
             conn.close()
 
@@ -318,6 +416,8 @@ class TransmodelDatabase:
         close_after = not self._in_memory
         try:
             for ddl in _TABLE_SCHEMAS.values():
+                conn.execute(ddl)
+            for ddl in _INDEX_SCHEMAS.values():
                 conn.execute(ddl)
             now = datetime.now(timezone.utc).isoformat()
             conn.execute(
@@ -355,6 +455,9 @@ class TransmodelDatabase:
                     self._migrate_nullable_stop_coords(conn)
                 for ddl in _TABLE_SCHEMAS.values():
                     conn.execute(ddl)
+                self._migrate_add_missing_columns(conn)
+                for ddl in _INDEX_SCHEMAS.values():
+                    conn.execute(ddl)
                 conn.execute(
                     "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
                     ("schema_version", SCHEMA_VERSION),
@@ -363,6 +466,23 @@ class TransmodelDatabase:
         finally:
             if close_after:
                 conn.close()
+
+    @staticmethod
+    def _migrate_add_missing_columns(conn: sqlite3.Connection) -> None:
+        """3.x -> 3.2: add the Task-1 field-gap columns and the `extras`
+        column in place. Idempotent — only columns that don't exist yet are
+        added, so re-running on a current database is a no-op."""
+        for table, cols in _MIGRATION_COLUMNS.items():
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for col, col_type in cols.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+        for table in _TABLE_SCHEMAS:
+            if table == "_meta":
+                continue
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if "extras" not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN extras TEXT")
 
     @staticmethod
     def _migrate_nullable_stop_coords(conn: sqlite3.Connection) -> None:
@@ -379,6 +499,7 @@ class TransmodelDatabase:
             conn.execute(_TABLE_SCHEMAS["scheduled_stop_point"])
             conn.execute(
                 "INSERT INTO scheduled_stop_point "
+                "(id, name, lat, lon, stop_area_id, wheelchair_boarding) "
                 "SELECT id, name, lat, lon, stop_area_id, wheelchair_boarding "
                 "FROM _ssp_migrate_old"
             )
@@ -409,7 +530,8 @@ class TransmodelDatabase:
         model_cls = TRANSMODEL_ENTITIES[table_name]
         fields = model_cls.model_fields
         cols = list(fields)
-        safe_cols = [f'"{c}"' if c == "order" else c for c in cols]
+        # Quote every column: "order" and "index" are SQL keywords
+        safe_cols = [f'"{c}"' for c in cols]
         placeholders = ",".join(["?"] * len(cols))
         sql = f"INSERT OR REPLACE INTO {table_name} ({','.join(safe_cols)}) VALUES ({placeholders})"
 
@@ -460,13 +582,11 @@ class TransmodelDatabase:
         if where:
             clauses = []
             for col, val in where.items():
-                safe_col = f'"{col}"' if col == "order" else col
-                clauses.append(f"{safe_col} = ?")
+                clauses.append(f'"{col}" = ?')
                 params.append(val)
             sql += " WHERE " + " AND ".join(clauses)
         if order_by:
-            safe_order = f'"{order_by}"' if order_by == "order" else order_by
-            sql += f" ORDER BY {safe_order}"
+            sql += f' ORDER BY "{order_by}"'
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         conn = self.connect()
@@ -493,8 +613,7 @@ class TransmodelDatabase:
         if where:
             clauses = []
             for col, val in where.items():
-                safe_col = f'"{col}"' if col == "order" else col
-                clauses.append(f"{safe_col} = ?")
+                clauses.append(f'"{col}" = ?')
                 params.append(val)
             sql += " WHERE " + " AND ".join(clauses)
         conn = self.connect()
@@ -512,8 +631,7 @@ class TransmodelDatabase:
         clauses = []
         params: list = []
         for col, val in where.items():
-            safe_col = f'"{col}"' if col == "order" else col
-            clauses.append(f"{safe_col} = ?")
+            clauses.append(f'"{col}" = ?')
             params.append(val)
         sql = f"DELETE FROM {table_name} WHERE " + " AND ".join(clauses)
         conn = self.connect()

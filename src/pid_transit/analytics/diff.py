@@ -27,6 +27,13 @@ class FeedDiffReport:
     frequency_changes: Dict[str, Any] = field(default_factory=dict)
     service_span_changes: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def has_changes(self) -> bool:
+        """True if any entity differs. This is the `≅` check of
+        docs/formalization.md §1: two datasets are equivalent iff their
+        diff report is empty."""
+        return any(ed.has_changes for ed in self.entity_diffs)
+
     def to_dict(self) -> Dict:
         result = {"entities": {}}
         for ed in self.entity_diffs:

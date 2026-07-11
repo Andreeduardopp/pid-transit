@@ -6,16 +6,14 @@ namespacing IDs to prevent collisions and optionally deduplicating
 nearby stops.
 """
 
-import math
 import logging
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..core.dataset import TransitDataset
+from ..core.geo import StopGrid
 from ..core.schemas import TRANSMODEL_ENTITIES
 
 logger = logging.getLogger(__name__)
-
-_EARTH_RADIUS_M = 6_371_000
 
 _ID_TABLES = [
     "operator", "line", "scheduled_stop_point", "level", "stop_area", "pathway",
@@ -42,15 +40,6 @@ _FK_MAP = {
     "shape_point": {},
     "fare_rule": {"fare_id": "fare_attribute"},
 }
-
-
-def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distance in meters between two lat/lon points."""
-    lat1, lon1, lat2, lon2 = (math.radians(x) for x in (lat1, lon1, lat2, lon2))
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    return 2 * _EARTH_RADIUS_M * math.asin(math.sqrt(a))
 
 
 class FeedMerger:
@@ -159,21 +148,25 @@ class FeedMerger:
     def _build_stop_proximity_map(
         self, source: TransitDataset, threshold_m: float
     ) -> Dict[str, str]:
-        """Map source stop IDs to existing target stop IDs if within threshold."""
+        """Map source stop IDs to existing target stop IDs within threshold.
+
+        Uses a :class:`StopGrid` spatial index so a merge of feeds with tens of
+        thousands of stops each runs in O(n+m) instead of the O(n·m) all-pairs
+        scan. Stops with missing coordinates are simply not matched.
+        """
         target_stops = self.target.db.get_records("scheduled_stop_point")
         source_stops = source.db.get_records("scheduled_stop_point")
 
+        grid = StopGrid(
+            ((t["id"], t.get("lat"), t.get("lon")) for t in target_stops),
+            threshold_m,
+        )
+
         mapping: Dict[str, str] = {}
         for src in source_stops:
-            best_dist = threshold_m
-            best_id = None
-            for tgt in target_stops:
-                d = _haversine(src["lat"], src["lon"], tgt["lat"], tgt["lon"])
-                if d < best_dist:
-                    best_dist = d
-                    best_id = tgt["id"]
-            if best_id is not None:
-                mapping[src["id"]] = best_id
+            hit = grid.nearest(src.get("lat"), src.get("lon"), threshold_m)
+            if hit is not None:
+                mapping[src["id"]] = hit[0]
 
         if mapping:
             logger.info(f"Proximity-merged {len(mapping)} stops (threshold={threshold_m}m)")

@@ -85,11 +85,24 @@ it did not — both sides were implemented:
 
 `bikes_allowed` has no clean NeTEx home and remains GTFS-only.
 
-## Remaining ideas (future work)
+## Remaining ideas — revisited 2026-07-10
 
-- Pass 1 re-parses timetable-only files it takes nothing from; a frame-sniff
-  could skip them (don't key off filename conventions).
-- Per-TPT `find()` calls dominate pass-2 CPU; a flat spi→stop dict and fewer
-  child lookups could shave wall time further.
+- ~~Pass-1 frame-sniff to skip timetable-only files~~ — **rejected as unsafe**:
+  pass 1 *does* take data from timetable files (Swiss `AvailabilityCondition`
+  calendars live in the TimetableFrame, and the ServiceJourney light-scan that
+  resolves pattern→line refs needs them). The mirror optimization was safe and
+  shipped instead: **pass 1 records which files contain journeys, and pass 2
+  skips the rest** (site/resource/service/calendar files — ~400 MB of XML on
+  the Swiss feed that was parsed twice for nothing).
+- Per-journey/per-TPT `find()` calls — **DONE**. `_Pass2.on_service_journey`
+  is now a single walk over the journey's direct children dispatching on
+  precomputed namespace-qualified tags; the same applies to per-TPT and
+  per-Call child lookups and the pass-1 ServiceJourney light-scan. The
+  `.//DayTypeRef` recursive subtree scan (the single most expensive lookup —
+  it walked every passing time of every journey) now only runs when neither
+  `dayTypes/DayTypeRef` nor an `AvailabilityConditionRef` matched. One
+  deliberate semantic nuance: a feed with *both* an availability condition and
+  a DayTypeRef hidden outside `dayTypes/` now resolves to the availability
+  condition (previously the stray DayTypeRef won).
 - The exporter buffers the whole output tree; equivalent streaming on the
-  export side remains lower priority.
+  export side remains lower priority (unchanged).

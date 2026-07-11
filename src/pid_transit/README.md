@@ -41,9 +41,23 @@ O coração agnóstico de formato. Define o que os dados *são* e como são guar
 | **`schemas.py`** | As entidades Transmodel como modelos **Pydantic v2** — `Operator`, `Line`, `ScheduledStopPoint`, `StopArea`, `Level`, `Pathway`, `DayType`, `OperatingDayException`, `JourneyPattern`, `PointInJourneyPattern`, `ServiceJourney`, `PassingTime`, `Frequency`, `Transfer`, `ShapePoint`, `FeedInfo`, `Attribution`, `FareAttribute`, `FareRule`, `Translation` — mais os enums `TransportMode` e `DirectionType`. É aqui que a validação forte acontece (tipos, campos obrigatórios, faixas de valores). |
 | **`database.py`** | `TransmodelDatabase`: wrapper SQLite com **integridade referencial** (`PRAGMA foreign_keys = ON`), modo em-arquivo ou em-memória, e versionamento de schema (`SCHEMA_VERSION = "3.0.0-transmodel"`) com auto-migração na abertura. As tabelas são definidas como DDL puro aqui. |
 | **`repositories.py`** | Camada de acesso a dados no padrão **Repository**, uma classe por entidade sobre uma `BaseRepository` genérica. Faz a ponte entre as linhas cruas do SQLite e os modelos Pydantic validados: `get_all`, `get_by_id`, `query(where, order_by, limit)`, `count`, `add` / `add_many`, `update` (com re-validação), `delete` / `delete_many`, além de métodos especializados (`lines.get_by_operator`, `passing_times.get_by_journey`, etc.). |
-| **`dataset.py`** | `TransitDataset`: a **fachada principal** da biblioteca e o ponto de entrada que você normalmente usa. Junta o banco e todos os repositórios numa API única e expõe `import_data(importer, source)`, `export_data(exporter, target)` e `validate()`. |
+| **`dataset.py`** | `TransitDataset`: a **fachada principal** da biblioteca e o ponto de entrada que você normalmente usa. Junta o banco e todos os repositórios numa API única e expõe `import_data(importer, source)`, `export_data(exporter, target)`, `validate(min_severity=…)` e `normalize_patterns()` (colapsa o quociente `JP/∼` no próprio banco, recusando-se a rodar se algum journey violar V17). É também um **context manager** (`with TransitDataset(...) as ds:` fecha a conexão de forma determinística — importa no Windows, onde um handle aberto trava a remoção do `.db`) e oferece construtores/exportadores de conveniência: `from_gtfs` / `from_netex` (criam o dataset e importam numa só chamada; em-memória por padrão) e `to_gtfs` / `to_netex` (exportam repassando os kwargs do adapter). Também expõe as operações bidirecionais de frequência `expand_frequencies()` (materializa cada janela `Frequency` em journeys concretos, tornando as métricas §3 corretas) e `compress_to_frequencies(min_run=3)` (a inversa: colapsa progressões aritméticas de partidas de volta em `Frequency`; `expand ∘ compress` reproduz as partidas exatamente). |
 | **`validator.py`** | Validação de **consistência lógica** que vai além do schema: toda `ServiceJourney` tem ao menos um `PassingTime`, não há ordem de passing time duplicada, toda `Line` tem ao menos um `JourneyPattern`, integridade de FK, etc. Reporta `ValidationIssue`s classificadas por `Severity` (`ERROR` / `WARNING` / `INFO`). |
 | **`exceptions.py`** | Exceções de domínio — `ImportFailedError`, `EntityNotFoundError`, `ValidationError`. |
+
+As conveniências da fachada evitam a repetição de criar-dataset + escolher-importer + `import_data` em todo script e teste:
+
+```python
+from pid_transit import TransitDataset
+
+# construtores de conveniência (em-memória por padrão; passe db= para arquivo)
+with TransitDataset.from_gtfs("feed.zip") as ds:
+    ds.normalize_patterns()          # colapsa patterns duplicados no banco
+    ds.to_netex("out.xml", deduplicate_patterns=False)
+# conexão fechada ao sair do bloco
+```
+
+A API explícita de adapters (`import_data(GtfsImporter(...), ...)`) continua sendo o caminho para power-users.
 
 ---
 
