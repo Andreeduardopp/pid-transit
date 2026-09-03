@@ -77,6 +77,7 @@ Isolam **toda** a lógica específica de cada formato, para que o core permaneç
 | **`netex_importer.py`** | NeTEx XML → banco | Detecta o namespace automaticamente; reconstrói tempos a partir de `DayOffset`; preserva `JourneyPattern`s nativos diretamente (sem síntese). |
 | **`netex_exporter.py`** | banco → NeTEx XML | Monta a estrutura multi-frame (Resource / Site / Service / ServiceCalendar / Timetable); flag opcional `deduplicate_patterns` colapsa patterns idênticos em canônicos; normaliza `25:30:00 → (01:30:00, DayOffset=1)`. |
 | **`spreadsheet_importer.py`** | CSV / XLSX → banco | Entrada via planilha — uma workbook Excel (uma aba por tabela) ou uma pasta de CSVs. |
+| **`gtfs_rt.py`** | GTFS-Realtime → memória | **Não segue o contrato de importer** de propósito: tempo real é um overlay efêmero, não um formato de arquivo. `fetch_snapshot(url_ou_arquivo)` baixa e parseia um `FeedMessage` protobuf num `RtSnapshot` (trip updates, posições de veículos, alertas); `match_snapshot(snapshot, dataset)` faz o join contra o dataset estático (`trip_id → ServiceJourney`, com fallback por rota + horário de partida para serviço por frequência) e produz um `RtMatchReport` com taxas de match e resumo de atrasos. Nada é persistido. Requer o extra opcional `pip install pid-transit[rt]`. |
 
 **Contrato de adapter:** importers implementam `import_to_db(db, source) -> dict[str, int]` (contagem de registros por tabela); exporters implementam `export_from_db(db, target)`. Adapters próprios (formato proprietário, API interna) só precisam seguir esse contrato.
 
@@ -105,6 +106,7 @@ pid-transit export --db city.db --format netex --output feed.xml
 pid-transit validate city.db
 pid-transit stats city.db --line L_10 --day-type WEEKDAY
 pid-transit diff january.db february.db --output report.md
+pid-transit rt-snapshot https://api.example.com/gtfs-rt.pb --db city.db --header "X-Access-Token: ..."
 ```
 
 ---

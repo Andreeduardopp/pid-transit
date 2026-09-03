@@ -241,6 +241,51 @@ def cmd_rt_readiness(args):
     sys.exit(0 if report.is_ready else 1)
 
 
+def cmd_rt_snapshot(args):
+    """Fetch a GTFS-RT feed and (optionally) match it against a database."""
+    from .adapters.gtfs_rt import fetch_snapshot, match_snapshot, snapshot_to_json
+    from .core.exceptions import ImportFailedError
+
+    headers = {}
+    for h in args.header:
+        if ":" not in h:
+            print(f"Invalid --header (expected 'Name: value'): {h}", file=sys.stderr)
+            sys.exit(1)
+        name, _, value = h.partition(":")
+        headers[name.strip()] = value.strip()
+
+    try:
+        snapshot = fetch_snapshot(args.source, headers=headers or None,
+                                  timeout=args.timeout)
+    except ImportFailedError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    if not args.db:
+        # No database: just parse and describe the feed.
+        if args.json:
+            print(snapshot_to_json(snapshot))
+        else:
+            print(f"GTFS-RT feed parsed (version {snapshot.gtfs_realtime_version}, "
+                  f"timestamp {snapshot.feed_timestamp}):")
+            print(f"  trip updates: {len(snapshot.trip_updates):,}")
+            print(f"  vehicle positions: {len(snapshot.vehicle_positions):,}")
+            print(f"  alerts: {len(snapshot.alerts):,}")
+        return
+
+    from .core.dataset import TransitDataset
+    with TransitDataset(args.db) as dataset:
+        report = match_snapshot(snapshot, dataset)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(report.to_markdown())
+
+    rate = report.match_rate
+    sys.exit(0 if rate is None or rate >= args.min_match_rate else 1)
+
+
 def cmd_normalize(args):
     """Collapse journey patterns to the canonical §2 quotient in place."""
     from .core.dataset import TransitDataset
@@ -374,6 +419,26 @@ def main():
     p_rt_ready.add_argument("db", help="Path to SQLite database")
     p_rt_ready.add_argument("--json", action="store_true", help="Emit the report as JSON")
     p_rt_ready.set_defaults(func=cmd_rt_readiness)
+
+    # rt-snapshot
+    p_rt_snap = subparsers.add_parser(
+        "rt-snapshot",
+        help="Fetch a GTFS-RT feed and match it against a database")
+    p_rt_snap.add_argument("source", help="Feed URL or path to a .pb file")
+    p_rt_snap.add_argument("--db", help="Database to match against "
+                                        "(omit to just parse and summarize)")
+    p_rt_snap.add_argument("--header", action="append", default=[],
+                           metavar="'Name: value'",
+                           help="HTTP header, e.g. an API key (repeatable)")
+    p_rt_snap.add_argument("--timeout", type=float, default=30.0,
+                           help="HTTP timeout in seconds (default 30)")
+    p_rt_snap.add_argument("--json", action="store_true",
+                           help="Emit the snapshot/report as JSON")
+    p_rt_snap.add_argument("--min-match-rate", type=float, default=0.0,
+                           dest="min_match_rate",
+                           help="Exit 1 if the trip match rate falls below "
+                                "this fraction (default 0 = never fail)")
+    p_rt_snap.set_defaults(func=cmd_rt_snapshot)
 
     # normalize
     p_norm = subparsers.add_parser(

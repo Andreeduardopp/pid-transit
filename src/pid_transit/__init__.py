@@ -38,6 +38,16 @@ from .analytics.statistics import TransitStatistics
 from .analytics.diff import FeedDiffer, FeedDiffReport
 from .analytics.merge import FeedMerger
 from .analytics.rt_readiness import check_rt_readiness, RTReadinessReport
+from .adapters.gtfs_rt import (
+    RtSnapshot,
+    RtTripUpdate,
+    RtVehiclePosition,
+    RtAlert,
+    RtMatchReport,
+    fetch_snapshot,
+    parse_feed,
+    match_snapshot,
+)
 
 __version__ = "0.7.0"
 
@@ -54,6 +64,14 @@ __all__ = [
     "FeedMerger",
     "check_rt_readiness",
     "RTReadinessReport",
+    "RtSnapshot",
+    "RtTripUpdate",
+    "RtVehiclePosition",
+    "RtAlert",
+    "RtMatchReport",
+    "fetch_snapshot",
+    "parse_feed",
+    "match_snapshot",
 
     # Models
     "Operator",
