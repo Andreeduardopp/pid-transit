@@ -8,8 +8,35 @@ version = "0.7.0"
 description = "A comprehensive transit data library based on Transmodel, supporting GTFS and NeTEx."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "PID-Transit contributors" }]
+keywords = [
+    "gtfs",
+    "gtfs-realtime",
+    "netex",
+    "transmodel",
+    "transit",
+    "public-transport",
+    "timetable",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Pydantic :: 2",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2.0",
     "openpyxl>=3.0"
@@ -24,6 +51,10 @@ dev = [
     "hypothesis>=6",
     "gtfs-realtime-bindings>=1.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/Andreeduardopp/PID-Toolkit"
+Issues = "https://github.com/Andreeduardopp/PID-Toolkit/issues"
 
 [project.scripts]
 pid-transit = "pid_transit.cli:main"
