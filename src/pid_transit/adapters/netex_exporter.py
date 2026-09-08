@@ -67,9 +67,101 @@ def _write_accessibility(parent: ET.Element, entity_id: str, wheelchair) -> None
     ET.SubElement(assessment, "MobilityImpairedAccess").text = _wheelchair_to_access(wheelchair)
 
 
+# The CEN ServiceFrame is a sequence, not a bag: its children are valid only in
+# schema order. Emitting them in the order that happens to be convenient is what
+# put <serviceLinks> and <connections> in illegal positions, and a misplaced child
+# does not fail alone — it breaks the frame's content model, so the ids inside it
+# never register and every reference to them fails as a dangling keyref. The
+# writer below appends in whatever order suits it and _order_frame_children puts
+# them right at the end, so adding a container later cannot silently repeat this.
+_SERVICE_FRAME_ORDER = (
+    "Name", "lines", "scheduledStopPoints", "serviceLinks", "connections",
+    "stopAssignments", "journeyPatterns",
+)
+
+
+def _order_frame_children(frame: ET.Element, order: tuple) -> None:
+    """Sort a frame's children into schema order.
+
+    Only for containers whose children are appended from several independent
+    branches. Where the writer emits in one straight line — a journey's
+    children, say — write them in order instead of sorting them afterwards.
+    """
+    rank = {tag: i for i, tag in enumerate(order)}
+    try:
+        frame[:] = sorted(frame, key=lambda el: rank[el.tag])
+    except KeyError as e:
+        raise ValueError(
+            f"<{e.args[0]}> was added to <{frame.tag}> but is missing from its "
+            f"schema order {order}; add it in the position the CEN sequence "
+            f"gives it"
+        ) from None
+
+
+def _split_shape_by_stops(shape_points: list, pattern_pts: list, stop_coords: dict) -> list:
+    """Cut a pattern's polyline into one segment per hop between its stops.
+
+    NeTEx carries geometry on ServiceLinks — one link per pair of consecutive
+    stops — so a GTFS shape, which is a single polyline for the whole pattern,
+    has to be divided. Each stop is snapped to its nearest shape point, and the
+    cut indices are forced strictly increasing so no hop is degenerate.
+
+    Adjacent segments deliberately share their junction point, which makes the
+    split loss-free: concatenating the segments and dropping each repeated
+    junction rebuilds the original polyline exactly. ``NetexImporter`` relies on
+    that when it reassembles a shape.
+
+    Returns ``[(from_stop_id, to_stop_id, [shape_point, ...]), ...]``, or ``[]``
+    when the pattern has fewer than two stops, or the shape has too few points
+    to give every hop at least two.
+    """
+    if len(pattern_pts) < 2 or len(shape_points) < len(pattern_pts):
+        return []
+
+    def nearest(lat, lon, lo: int, hi: int) -> int:
+        """Index of the closest shape point within [lo, hi]."""
+        best, best_d = lo, None
+        for i in range(lo, hi + 1):
+            p = shape_points[i]
+            d = (p["lat"] - lat) ** 2 + (p["lon"] - lon) ** 2
+            if best_d is None or d < best_d:
+                best, best_d = i, d
+        return best
+
+    # First and last stops anchor the ends of the shape; the rest snap in order.
+    # The search is bounded rather than clamped afterwards, so a stop can never
+    # be snapped to an index the hops after it need. That is a correctness
+    # tidy-up, not a speed one: `hi` sits only `remaining` points from the end,
+    # so it trims about 2% of the scan (measured), and the split stays
+    # O(stops x shape_points). Making it linear means giving up exact
+    # nearest-point snapping for a monotone walk, which no feed on hand can
+    # currently validate — see "What the cut costs" in NETEX_EXPORT.md.
+    cuts = [0]
+    for pt in pattern_pts[1:-1]:
+        coord = stop_coords.get(pt["stop_point_id"])
+        lo = cuts[-1] + 1
+        # Leave room for the hops that still have to fit after this one.
+        remaining = len(pattern_pts) - len(cuts) - 1
+        hi = len(shape_points) - 1 - remaining
+        cuts.append(nearest(coord[0], coord[1], lo, hi) if coord else lo)
+    cuts.append(len(shape_points) - 1)
+
+    return [
+        (pattern_pts[i]["stop_point_id"],
+         pattern_pts[i + 1]["stop_point_id"],
+         shape_points[cuts[i]:cuts[i + 1] + 1])
+        for i in range(len(cuts) - 1)
+    ]
+
+
 class NetexExporter:
     """
-    Exports a TransmodelDatabase to a NeTEx XML file (PT-EPIP profile).
+    Exports a TransmodelDatabase to a NeTEx XML file in an EPIP-style dialect.
+
+    "EPIP" is the CEN European Passenger Information Profile: the frame layout
+    below follows it, but the output is not yet checked against it, and
+    ``profile`` is currently inert (roadmap task 9). Nothing here is specific to
+    the Portuguese national profile.
 
     Frames produced:
       ResourceFrame  — Operators
@@ -203,14 +295,13 @@ class NetexExporter:
             _write_accessibility(el, sp["id"], sp.get("wheelchair_boarding"))
             ET.SubElement(el, "StopPlaceType").text = "onstreetBus"
 
-        # Emit Quays as direct children of the SiteFrame (siblings of stopPlaces),
-        # not nested inside StopPlace. European-profile converters resolve a passing
-        # time to a physical stop via ScheduledStopPoint.QuayRef -> Quay; a Quay only
-        # registers when it appears as a top-level element (a Quay nested inside a
-        # StopPlace is consumed with the StopPlace and never indexed). EPIP-faithful
-        # tools (incl. our own importer) read StopPlace and ignore these. Additive.
-        quays_el = ET.SubElement(frame, "quays")
-        for sp in stops:
+            # A Quay per StopPlace, nested. European-profile converters resolve a
+            # passing time to a physical stop via ScheduledStopPoint -> Quay, so
+            # the Quays have to exist; the binding itself is a
+            # PassengerStopAssignment in the ServiceFrame (see _write_service_frame).
+            # These were emitted as a top-level <quays> sibling of <stopPlaces>
+            # until 2026-09-07, which the CEN SiteFrame does not admit.
+            quays_el = ET.SubElement(el, "quays")
             quay = ET.SubElement(quays_el, "Quay", attrib={
                 "id": f"{sp['id']}:Quay", "version": "1"
             })
@@ -259,12 +350,26 @@ class NetexExporter:
             for sp in stops:
                 el = ET.SubElement(ssps_el, "ScheduledStopPoint", attrib={
                     "id": sp["id"], "version": "1",
-                    # Link to the Quay nested in the SiteFrame. European-profile
-                    # converters use this attribute to resolve a passing time to a
-                    # physical stop; our importer ignores it (round-trip-safe).
-                    "QuayRef": f"{sp['id']}:Quay",
                 })
                 ET.SubElement(el, "Name").text = sp["name"]
+
+            # Bind each ScheduledStopPoint to its Quay. This was a QuayRef
+            # *attribute* on ScheduledStopPoint until 2026-09-07 — convenient for
+            # third-party loaders but not legal NeTEx: QuayRef is an element, and
+            # ScheduledStopPoint admits it in neither form. PassengerStopAssignment
+            # is the conformant binding, and the one our own importer already reads
+            # (netex_importer.py, on_assignment).
+            assignments_el = ET.SubElement(frame, "stopAssignments")
+            for order, sp in enumerate(stops, start=1):
+                psa = ET.SubElement(assignments_el, "PassengerStopAssignment", attrib={
+                    "id": f"{sp['id']}:PSA", "version": "1", "order": str(order),
+                })
+                ET.SubElement(psa, "ScheduledStopPointRef", attrib={
+                    "ref": sp["id"], "version": "1",
+                })
+                ET.SubElement(psa, "QuayRef", attrib={
+                    "ref": f"{sp['id']}:Quay", "version": "1",
+                })
 
         if patterns:
             points_by_pattern: dict = {}
@@ -276,8 +381,13 @@ class NetexExporter:
             if self._canonical_jps is not None:
                 patterns = [jp for jp in patterns if jp["id"] in self._canonical_jps]
 
-            # Shapes ride along on their journey pattern as a
-            # LinkSequenceProjection (a JourneyPattern is a LinkSequence).
+            # Shape geometry is carried by ServiceLinks, one per hop between
+            # consecutive stops, referenced from the pattern's linksInSequence.
+            # Until 2026-09-07 it was a projections/LinkSequenceProjection on the
+            # JourneyPattern itself, which reads naturally but is not legal NeTEx:
+            # a JourneyPattern admits no projections (verified against the CEN XSD
+            # from two independent positions), and ServiceLink is the only host the
+            # schema accepts for a LinkSequenceProjection.
             # Patterns are mapped to the shape of their journeys; per-journey
             # shape variation within one pattern is not representable here.
             jp_shape: dict = {}
@@ -296,6 +406,87 @@ class NetexExporter:
                         if self._jp_remap:
                             jp_shape.setdefault(self._jp_remap.get(jp_id, jp_id), sid)
 
+            # Cut each pattern's polyline into per-hop segments up front: the
+            # ServiceLinks must be written before journeyPatterns to satisfy the
+            # ServiceFrame's element order.
+            stop_coords = {
+                s["id"]: (s["lat"], s["lon"])
+                for s in stops if s.get("lat") is not None and s.get("lon") is not None
+            }
+            # Keyed by (shape, stop sequence), not by shape alone. A hop is a
+            # link between two consecutive stops, so two patterns can only share
+            # links if they run the same stops over the same shape — sharing by
+            # shape alone handed a pattern the cuts made for a different stop
+            # list, producing links that skipped stops it serves and named stops
+            # it does not. Patterns that do match still share, so the geometry is
+            # written once and the importer's shape de-duplication still holds.
+            shape_links: dict = {}     # key -> [(link id, from, to, [points])]
+            pattern_links: dict = {}   # jp id -> key into shape_links
+            shape_variants: dict = {}  # shape id -> distinct cuts issued so far
+            for jp in patterns:
+                shape_id = jp_shape.get(jp["id"])
+                if not shape_id:
+                    continue
+                pattern_pts = points_by_pattern.get(jp["id"], [])
+                key = (shape_id, tuple(pt["stop_point_id"] for pt in pattern_pts))
+                if key not in shape_links:
+                    segments = _split_shape_by_stops(
+                        shapes_by_id[shape_id], pattern_pts, stop_coords,
+                    )
+                    if segments:
+                        # The first cut of a shape keeps the shape's own id, so
+                        # the common one-cut-per-shape case round-trips to the
+                        # same shape id it came from; further cuts are suffixed.
+                        n = shape_variants[shape_id] = shape_variants.get(shape_id, 0) + 1
+                        prefix = shape_id if n == 1 else f"{shape_id}:v{n}"
+                        shape_links[key] = [
+                            (f"{prefix}:link:{i}", frm, to, pts)
+                            for i, (frm, to, pts) in enumerate(segments, start=1)
+                        ]
+                    else:
+                        logger.warning(
+                            "Shape %s has too few points (%d) for the %d stops of "
+                            "JourneyPattern %s; exporting it without geometry",
+                            shape_id, len(shapes_by_id[shape_id]),
+                            len(pattern_pts), jp["id"],
+                        )
+                        # Memoized so the failed split is not retried for every
+                        # other pattern that uses this shape and stop sequence.
+                        shape_links[key] = []
+                if shape_links[key]:
+                    pattern_links[jp["id"]] = key
+
+            if any(shape_links.values()):
+                links_el = ET.SubElement(frame, "serviceLinks")
+                # gml:id is xs:ID — an NCName — so it cannot simply mirror the
+                # NeTEx object id, which is a far looser string: real feeds carry
+                # '|' and other characters that are legal there and illegal here
+                # (Porto's shape ids do). These ids are internal to the GML and
+                # carry no meaning for a consumer, so number them instead.
+                gml_seq = 0
+                for segments in shape_links.values():
+                    for link_id, from_stop, to_stop, seg_points in segments:
+                        gml_seq += 1
+                        link = ET.SubElement(links_el, "ServiceLink", attrib={
+                            "id": link_id, "version": "1"
+                        })
+                        projections = ET.SubElement(link, "projections")
+                        proj = ET.SubElement(projections, "LinkSequenceProjection", attrib={
+                            "id": f"{link_id}:proj", "version": "1"
+                        })
+                        line_string = ET.SubElement(proj, "gml:LineString", attrib={
+                            "gml:id": f"ls_{gml_seq}"
+                        })
+                        ET.SubElement(line_string, "gml:posList").text = " ".join(
+                            f"{p['lat']} {p['lon']}" for p in seg_points
+                        )
+                        ET.SubElement(link, "FromPointRef", attrib={
+                            "ref": from_stop, "version": "1"
+                        })
+                        ET.SubElement(link, "ToPointRef", attrib={
+                            "ref": to_stop, "version": "1"
+                        })
+
             patterns_el = ET.SubElement(frame, "journeyPatterns")
             for jp in patterns:
                 el = ET.SubElement(patterns_el, "JourneyPattern", attrib={
@@ -303,19 +494,6 @@ class NetexExporter:
                 })
                 if jp.get("direction"):
                     ET.SubElement(el, "DirectionType").text = jp["direction"]
-
-                shape_id = jp_shape.get(jp["id"])
-                if shape_id:
-                    projections = ET.SubElement(el, "projections")
-                    proj = ET.SubElement(projections, "LinkSequenceProjection", attrib={
-                        "id": shape_id, "version": "1"
-                    })
-                    line_string = ET.SubElement(proj, "gml:LineString", attrib={
-                        "gml:id": f"ls_{jp['id'].replace(':', '_')}"
-                    })
-                    ET.SubElement(line_string, "gml:posList").text = " ".join(
-                        f"{p['lat']} {p['lon']}" for p in shapes_by_id[shape_id]
-                    )
 
                 pattern_pts = points_by_pattern.get(jp["id"], [])
                 if pattern_pts:
@@ -329,6 +507,20 @@ class NetexExporter:
                         })
                         ET.SubElement(spi, "ScheduledStopPointRef", attrib={
                             "ref": pt["stop_point_id"], "version": "1"
+                        })
+
+                links_key = pattern_links.get(jp["id"])
+                if links_key:
+                    links_seq = ET.SubElement(el, "linksInSequence")
+                    for order, (link_id, _f, _t, _p) in enumerate(
+                            shape_links[links_key], start=1):
+                        slijp = ET.SubElement(
+                            links_seq, "ServiceLinkInJourneyPattern", attrib={
+                                "id": f"{jp['id']}:inJP:{order}", "version": "1",
+                                "order": str(order),
+                            })
+                        ET.SubElement(slijp, "ServiceLinkRef", attrib={
+                            "ref": link_id, "version": "1"
                         })
 
         transfers = db.get_records("transfer")
@@ -354,6 +546,8 @@ class NetexExporter:
                 ET.SubElement(to_el, "ScheduledStopPointRef", attrib={
                     "ref": tr["to_stop_id"], "version": "1"
                 })
+
+        _order_frame_children(frame, _SERVICE_FRAME_ORDER)
 
     # -------------------------------------------------------------------------
     # ServiceCalendarFrame — day types
@@ -463,23 +657,6 @@ class NetexExporter:
                     "ref": sj["line_id"], "version": "1"
                 })
 
-                if frequencies:
-                    groups_el = ET.SubElement(el, "frequencyGroups")
-                    for i, fr in enumerate(frequencies, 1):
-                        hjg = ET.SubElement(groups_el, "HeadwayJourneyGroup", attrib={
-                            "id": f"{sj['id']}:hjg:{i}", "version": "1"
-                        })
-                        if fr.get("exact_times"):
-                            key_list = ET.SubElement(hjg, "keyList")
-                            kv = ET.SubElement(key_list, "KeyValue")
-                            ET.SubElement(kv, "Key").text = "gtfs_exact_times"
-                            ET.SubElement(kv, "Value").text = str(fr["exact_times"])
-                        ET.SubElement(hjg, "ScheduledHeadwayInterval").text = (
-                            f"PT{fr['headway_secs']}S"
-                        )
-                        ET.SubElement(hjg, "FirstDepartureTime").text = fr["start_time"]
-                        ET.SubElement(hjg, "LastDepartureTime").text = fr["end_time"]
-
                 sj_pts = pt_by_journey.get(sj["id"], [])
                 if sj_pts:
                     spi_ids = [spi_id for _, spi_id
@@ -504,3 +681,25 @@ class NetexExporter:
                             ET.SubElement(tpt, "DepartureTime").text = dep_t
                             if dep_off:
                                 ET.SubElement(tpt, "DepartureDayOffset").text = str(dep_off)
+
+                # After passingTimes: a (Template)ServiceJourney's children are a
+                # schema sequence, and frequencyGroups follows passingTimes in it.
+                if frequencies:
+                    groups_el = ET.SubElement(el, "frequencyGroups")
+                    for i, fr in enumerate(frequencies, 1):
+                        hjg = ET.SubElement(groups_el, "HeadwayJourneyGroup", attrib={
+                            "id": f"{sj['id']}:hjg:{i}", "version": "1"
+                        })
+                        if fr.get("exact_times"):
+                            key_list = ET.SubElement(hjg, "keyList")
+                            kv = ET.SubElement(key_list, "KeyValue")
+                            ET.SubElement(kv, "Key").text = "gtfs_exact_times"
+                            ET.SubElement(kv, "Value").text = str(fr["exact_times"])
+                        # Order is fixed by the schema here too: the two bounds,
+                        # then the interval. (Our importer reads these by name,
+                        # so the swap is invisible to a round-trip.)
+                        ET.SubElement(hjg, "FirstDepartureTime").text = fr["start_time"]
+                        ET.SubElement(hjg, "LastDepartureTime").text = fr["end_time"]
+                        ET.SubElement(hjg, "ScheduledHeadwayInterval").text = (
+                            f"PT{fr['headway_secs']}S"
+                        )

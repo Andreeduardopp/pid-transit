@@ -11,6 +11,7 @@ import logging
 import re
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -198,7 +199,10 @@ class _RunState:
         self.route_to_line: Dict[str, str] = {}     # Route id -> Line id
         self.line_ids: set = set()
         self.day_type_ids: set = set()
-        self.jp_to_line: Dict[str, str] = {}        # pattern id -> line id (via SJs)
+        # pattern id -> line id. Seeded from journeys that name both, then
+        # overwritten in _flush_reference_data with the line actually resolved
+        # for the pattern (which may have come via its route). Pass 2 reads it.
+        self.jp_to_line: Dict[str, str] = {}
         # pattern id -> (direction, route_ref, [(order, spi_id, ssp_ref), ...])
         self.patterns: Dict[str, tuple] = {}
         # calendar structures
@@ -209,6 +213,11 @@ class _RunState:
         self.jp_shape: Dict[str, str] = {}          # pattern id -> shape id
         self.shape_ids: set = set()
         self.shape_points: List[dict] = []
+        # Geometry carried on ServiceLinks (the schema-valid form): the links
+        # and the patterns that use them can arrive in either order, and in
+        # different files, so both are buffered and joined at flush time.
+        self.link_geometry: Dict[str, List[tuple]] = {}   # link id -> [(lat, lon), ...]
+        self.jp_links: Dict[str, List[str]] = {}          # pattern id -> ordered link ids
         # pass-1 row buffers (small entities, flushed once)
         self.operators: List[dict] = []
         self.day_types: Dict[str, dict] = {}        # id -> row (dates may be updated)
@@ -568,6 +577,28 @@ class NetexImporter:
                 "min_transfer_time": duration,
             })
 
+        def on_service_link(link: ET.Element) -> None:
+            """A hop's geometry, in either form the CEN LinkGroup allows.
+
+            The sequence is `... gml:LineString, projections ...`, so a Link may
+            carry its line directly or wrap it in a LinkSequenceProjection.
+            Producers use both; matching posList at any depth covers them.
+            """
+            link_id = link.attrib.get("id")
+            if not link_id or link_id in state.link_geometry:
+                return
+            pos = link.find(".//g:posList", {**self._ns, "g": _GML_NS})
+            if pos is None or not pos.text:
+                return
+            values = pos.text.split()
+            try:
+                state.link_geometry[link_id] = [
+                    (float(values[i]), float(values[i + 1]))
+                    for i in range(0, len(values) - 1, 2)
+                ]
+            except ValueError:
+                logger.warning("Invalid gml:posList on ServiceLink %s", link_id)
+
         def on_pattern(jp: ET.Element) -> None:
             jpid = jp.attrib.get("id")
             if not jpid:
@@ -576,8 +607,28 @@ class NetexImporter:
             route_ref_el = jp.find("n:RouteRef", self._ns)
             route_ref = route_ref_el.attrib.get("ref") if route_ref_el is not None else None
 
-            # A JourneyPattern is a LinkSequence: its shape rides along as a
-            # projections/LinkSequenceProjection with a gml:posList.
+            # Preferred form: geometry lives on ServiceLinks and the pattern
+            # names them in order. Collected here, joined in _flush_reference_data
+            # once every link has been seen (they may be in another file).
+            links_seq = jp.find("n:linksInSequence", self._ns)
+            if links_seq is not None:
+                ordered = []
+                for slijp in links_seq:
+                    ref = slijp.find("n:ServiceLinkRef", self._ns)
+                    if ref is None or not ref.attrib.get("ref"):
+                        continue
+                    try:
+                        order = int(slijp.attrib.get("order", len(ordered) + 1))
+                    except ValueError:
+                        order = len(ordered) + 1
+                    ordered.append((order, ref.attrib["ref"]))
+                if ordered:
+                    ordered.sort(key=lambda t: t[0])
+                    state.jp_links[jpid] = [ref for _o, ref in ordered]
+
+            # Legacy form, still read: our own exporter put the whole polyline on
+            # the pattern as projections/LinkSequenceProjection until 2026-09-07.
+            # Not valid NeTEx, but feeds produced by older releases exist.
             proj = jp.find("n:projections/n:LinkSequenceProjection", self._ns)
             if proj is not None:
                 shape_id = proj.attrib.get("id") or f"{jpid}:shape"
@@ -616,18 +667,25 @@ class NetexImporter:
             state.files_with_journeys.add(state.current_file)
             uri = self._ns["n"]
             q_jp = f"{{{uri}}}JourneyPatternRef"
+            q_sjp = f"{{{uri}}}ServiceJourneyPatternRef"
             q_lr = f"{{{uri}}}LineRef"
-            jp = lr = None
+            jp = sjp = lr = None
             for child in sj:
                 tag = child.tag
                 if tag == q_jp:
                     if jp is None:
                         jp = child.attrib.get("ref")
+                elif tag == q_sjp:
+                    # Pass 2 accepts either spelling; so must this, or the
+                    # fallback is dead for profiles that only use the subtype.
+                    if sjp is None:
+                        sjp = child.attrib.get("ref")
                 elif tag == q_lr:
                     if lr is None:
                         lr = child.attrib.get("ref")
                 if jp is not None and lr is not None:
                     break
+            jp = jp or sjp
             if jp and lr and jp not in state.jp_to_line:
                 state.jp_to_line[jp] = lr
 
@@ -645,6 +703,7 @@ class NetexImporter:
             "UicOperatingPeriod": on_operating_period,
             "AvailabilityCondition": on_availability_condition,
             "Connection": on_connection,
+            "ServiceLink": on_service_link,
             "JourneyPattern": on_pattern,
             # Subtypes used by production feeds (e.g. the Swiss profile).
             "ServiceJourneyPattern": on_pattern,
@@ -750,6 +809,72 @@ class NetexImporter:
                 self._report("transfer", state.stats["transfer"])
             state.transfers = []
 
+        # Rebuild each pattern's polyline from its ServiceLinks. Adjacent
+        # segments share their junction point (the exporter's split guarantees
+        # it), so every segment after the first drops its leading point and the
+        # original line comes back exactly.
+        #
+        # Identity comes from the link sequence, not from parsing a link id:
+        # patterns that traverse exactly the same links share one shape, and
+        # patterns that do not never collide, whatever the producer's id scheme.
+        shape_by_links: Dict[tuple, str] = {}
+        # How many patterns still need each link, so its coordinates can be
+        # dropped as soon as the last one has consumed them rather than held
+        # until the whole feed is rebuilt.
+        pending = Counter(lid for lids in state.jp_links.values() for lid in lids)
+        for jpid, link_ids in state.jp_links.items():
+            key = tuple(link_ids)
+            shape_id = shape_by_links.get(key)
+            segments = (None if shape_id is not None
+                        else [state.link_geometry.get(lid) for lid in link_ids])
+
+            # Release each link's coordinates as soon as the last pattern that
+            # needs them has read them, so the rebuilt shape_points and the raw
+            # geometry are never both held for the whole feed.
+            for lid in link_ids:
+                pending[lid] -= 1
+                if pending[lid] <= 0:
+                    state.link_geometry.pop(lid, None)
+
+            if shape_id is not None:
+                state.jp_shape[jpid] = shape_id
+                continue
+            if not all(segments):
+                missing = [l for l, s in zip(link_ids, segments) if not s]
+                logger.warning(
+                    "JourneyPattern %s references %d ServiceLink(s) with no usable "
+                    "geometry (e.g. %s); dropping its shape",
+                    jpid, len(missing), missing[0],
+                )
+                continue
+
+            # Our own exporter names links after the shape they were cut from,
+            # so recovering that name makes a round-trip land on the shape id it
+            # started with. Any other producer's ids fall back to the pattern.
+            head = link_ids[0]
+            shape_id = head.rsplit(":link:", 1)[0] if ":link:" in head else f"{jpid}:shape"
+            if shape_id in state.shape_ids:
+                # Taken by another link sequence, or by a legacy projection on
+                # this same pattern. Distinct geometry needs a distinct id.
+                base, n = f"{jpid}:shape", 1
+                shape_id = base
+                while shape_id in state.shape_ids:
+                    n += 1
+                    shape_id = f"{base}:{n}"
+            shape_by_links[key] = shape_id
+            state.jp_shape[jpid] = shape_id
+
+            coords = list(segments[0])
+            for seg in segments[1:]:
+                coords.extend(seg[1:] if seg[0] == coords[-1] else seg)
+            state.shape_points.extend(
+                {"shape_id": shape_id, "lat": lat, "lon": lon, "sequence": i}
+                for i, (lat, lon) in enumerate(coords)
+            )
+            state.shape_ids.add(shape_id)
+        state.jp_links = {}
+        state.link_geometry = {}
+
         if state.shape_points:
             for i in range(0, len(state.shape_points), BATCH_SIZE):
                 self._check_cancel()
@@ -792,6 +917,10 @@ class NetexImporter:
                 continue
             patterns.append({"id": jpid, "line_id": line_id, "direction": direction})
             state.pattern_ids.add(jpid)
+            # Pass 2 consults this for journeys that name only their pattern —
+            # the European-profile indirection, where the line is two hops up
+            # (journey -> pattern -> route -> line).
+            state.jp_to_line[jpid] = line_id
             for order, _spi_id, ssp_ref in spi_points:
                 if ssp_ref not in state.stop_ids:
                     logger.warning(
@@ -877,7 +1006,7 @@ class _Pass2:
 
     _TAGS = (
         "DepartureTime", "DepartureDayOffset", "LineRef", "JourneyPatternRef",
-        "ServiceJourneyPatternRef", "dayTypes", "DayTypeRef",
+        "ServiceJourneyPatternRef", "RouteRef", "dayTypes", "DayTypeRef",
         "validityConditions", "AvailabilityConditionRef", "frequencyGroups",
         "passingTimes", "calls", "AccessibilityAssessment",
         "MobilityImpairedAccess", "TimetabledPassingTime",
@@ -925,7 +1054,7 @@ class _Pass2:
         Q = self._qtags()
 
         dep_time_text = dep_offset_text = None
-        line_id = jp_ref_id = sjp_ref_id = None
+        line_id = jp_ref_id = sjp_ref_id = route_ref_id = None
         day_type_id = avail_ref_id = None
         wheelchair = None
         freq_groups = pt_container = calls_el = None
@@ -953,6 +1082,9 @@ class _Pass2:
             elif tag == Q["ServiceJourneyPatternRef"]:
                 if sjp_ref_id is None:
                     sjp_ref_id = child.attrib.get("ref")
+            elif tag == Q["RouteRef"]:
+                if route_ref_id is None:
+                    route_ref_id = child.attrib.get("ref")
             elif tag == Q["dayTypes"]:
                 if day_type_id is None:
                     for r in child:
@@ -980,6 +1112,16 @@ class _Pass2:
             int(dep_offset_text) if dep_offset_text else 0)
 
         jp_id = jp_ref_id or sjp_ref_id
+
+        if not line_id:
+            # European-profile indirection: the journey names only its pattern
+            # (or its route) and the line sits one or two hops up. Pass 1 has
+            # already resolved both chains, so consult them instead of dropping
+            # the journey below.
+            if jp_id:
+                line_id = self.state.jp_to_line.get(jp_id)
+            if not line_id and route_ref_id:
+                line_id = self.state.route_to_line.get(route_ref_id)
 
         if day_type_id is None and avail_ref_id is None:
             # Rare path: a DayTypeRef somewhere other than dayTypes/. Only

@@ -339,6 +339,211 @@ class TestMultiFileSources:
             NetexImporter().import_to_db(db, d)
 
 
+# French/European-profile shape: the line is named exactly once, on the Route.
+# The ServiceJourneyPattern carries only a RouteRef and the ServiceJourney only
+# a ServiceJourneyPatternRef, so resolving a journey's line takes two hops
+# (journey -> pattern -> route -> line). Structural reproduction of the Fluo
+# Grand Est feed from RESULTS.md §3.2.1.
+FRENCH_PROFILE_NETEX = """<?xml version="1.0" encoding="UTF-8"?>
+<PublicationDelivery xmlns="http://www.netex.org.uk/netex" version="1.1">
+ <dataObjects>
+  <CompositeFrame id="cf" version="1">
+   <frames>
+    <ResourceFrame id="rf" version="1">
+     <organisations>
+      <Operator id="op:1" version="1"><Name>Transporteur RIV</Name></Operator>
+     </organisations>
+    </ResourceFrame>
+    <SiteFrame id="sf" version="1">
+     <stopPlaces>
+      <StopPlace id="sp:1" version="1"><Name>Gare</Name>
+       <Centroid><Location><Longitude>6.17</Longitude><Latitude>48.69</Latitude></Location></Centroid>
+      </StopPlace>
+      <StopPlace id="sp:2" version="1"><Name>Place Stanislas</Name>
+       <Centroid><Location><Longitude>6.18</Longitude><Latitude>48.69</Latitude></Location></Centroid>
+      </StopPlace>
+     </stopPlaces>
+    </SiteFrame>
+    <ServiceFrame id="svf" version="1">
+     <lines>
+      <Line id="line:1" version="1">
+       <Name>Ligne 1</Name><TransportMode>bus</TransportMode>
+       <OperatorRef ref="op:1"/>
+      </Line>
+     </lines>
+     <routes>
+      <Route id="route:1" version="1">
+       <Name>Ligne 1 Aller</Name>
+       <LineRef ref="line:1"/>
+      </Route>
+     </routes>
+     <scheduledStopPoints>
+      <ScheduledStopPoint id="ssp:1" version="1"><Name>Gare</Name></ScheduledStopPoint>
+      <ScheduledStopPoint id="ssp:2" version="1"><Name>Place Stanislas</Name></ScheduledStopPoint>
+     </scheduledStopPoints>
+     <stopAssignments>
+      <PassengerStopAssignment id="psa:1" version="1" order="1">
+       <ScheduledStopPointRef ref="ssp:1"/><StopPlaceRef ref="sp:1"/>
+      </PassengerStopAssignment>
+      <PassengerStopAssignment id="psa:2" version="1" order="2">
+       <ScheduledStopPointRef ref="ssp:2"/><StopPlaceRef ref="sp:2"/>
+      </PassengerStopAssignment>
+     </stopAssignments>
+     <journeyPatterns>
+      <ServiceJourneyPattern id="sjp:1" version="1">
+       <RouteRef ref="route:1"/>
+       <pointsInSequence>
+        <StopPointInJourneyPattern id="spijp:1" version="1" order="1">
+         <ScheduledStopPointRef ref="ssp:1"/>
+        </StopPointInJourneyPattern>
+        <StopPointInJourneyPattern id="spijp:2" version="1" order="2">
+         <ScheduledStopPointRef ref="ssp:2"/>
+        </StopPointInJourneyPattern>
+       </pointsInSequence>
+      </ServiceJourneyPattern>
+     </journeyPatterns>
+    </ServiceFrame>
+    <ServiceCalendarFrame id="scf" version="1">
+     <dayTypes>
+      <DayType id="dt:1" version="1">
+       <properties><PropertyOfDay><DaysOfWeek>Monday Tuesday</DaysOfWeek></PropertyOfDay></properties>
+      </DayType>
+     </dayTypes>
+    </ServiceCalendarFrame>
+    <TimetableFrame id="tf" version="1">
+     <vehicleJourneys>
+      <ServiceJourney id="sj:1" version="1">
+       <DepartureTime>06:30:00</DepartureTime>
+       <dayTypes><DayTypeRef ref="dt:1"/></dayTypes>
+       <ServiceJourneyPatternRef ref="sjp:1"/>
+       <passingTimes>
+        <TimetabledPassingTime version="0">
+         <StopPointInJourneyPatternRef ref="spijp:1"/>
+         <DepartureTime>06:30:00</DepartureTime>
+        </TimetabledPassingTime>
+        <TimetabledPassingTime version="0">
+         <StopPointInJourneyPatternRef ref="spijp:2"/>
+         <ArrivalTime>06:42:00</ArrivalTime>
+        </TimetabledPassingTime>
+       </passingTimes>
+      </ServiceJourney>
+      <ServiceJourney id="sj:2" version="1">
+       <DepartureTime>07:30:00</DepartureTime>
+       <dayTypes><DayTypeRef ref="dt:1"/></dayTypes>
+       <ServiceJourneyPatternRef ref="sjp:1"/>
+       <passingTimes>
+        <TimetabledPassingTime version="0">
+         <StopPointInJourneyPatternRef ref="spijp:1"/>
+         <DepartureTime>07:30:00</DepartureTime>
+        </TimetabledPassingTime>
+        <TimetabledPassingTime version="0">
+         <StopPointInJourneyPatternRef ref="spijp:2"/>
+         <ArrivalTime>07:42:00</ArrivalTime>
+        </TimetabledPassingTime>
+       </passingTimes>
+      </ServiceJourney>
+     </vehicleJourneys>
+    </TimetableFrame>
+   </frames>
+  </CompositeFrame>
+ </dataObjects>
+</PublicationDelivery>
+"""
+
+
+def _split_french_netex() -> dict:
+    """FRENCH_PROFILE_NETEX split the way the Fluo package ships it, with the
+    timetable member sorting first — the worst case for reference resolution."""
+    import re
+    frame = {}
+    for name in ("ResourceFrame", "SiteFrame", "ServiceFrame",
+                 "ServiceCalendarFrame", "TimetableFrame"):
+        frame[name] = re.search(
+            rf"<{name}\b.*?</{name}>", FRENCH_PROFILE_NETEX, re.S
+        ).group(0)
+    return {
+        "Ligne_RIV_1.xml": _wrap_frames(frame["TimetableFrame"]),
+        "arrets.xml": _wrap_frames(frame["SiteFrame"]),
+        "calendriers.xml": _wrap_frames(frame["ServiceCalendarFrame"]),
+        "reseaux.xml": _wrap_frames(frame["ResourceFrame"], frame["ServiceFrame"]),
+    }
+
+
+class TestJourneyLevelLineIndirection:
+    """Roadmap task 9, Dependency 0: a journey that never names its own line.
+
+    Three distinct indirections, each of which used to drop the journey (or its
+    pattern) silently — the blocker between this importer and most European NAP
+    feeds.
+    """
+
+    def _import(self, db, tmp_path, content, name="fluo.xml"):
+        path = tmp_path / name
+        path.write_text(content, encoding="utf-8")
+        return NetexImporter().import_to_db(db, path)
+
+    # (a) journey -> ServiceJourneyPatternRef -> RouteRef -> LineRef
+    def test_line_resolved_through_pattern(self, db, tmp_path):
+        stats = self._import(db, tmp_path, FRENCH_PROFILE_NETEX)
+        assert stats.get("service_journey", 0) == 2
+        assert stats.get("passing_time", 0) == 4
+        assert {j["line_id"] for j in db.get_records("service_journey")} == {"line:1"}
+
+    def test_pattern_and_passing_times_line_up(self, db, tmp_path):
+        self._import(db, tmp_path, FRENCH_PROFILE_NETEX)
+        journeys = db.query("service_journey", where={"id": "sj:1"})
+        assert journeys[0]["journey_pattern_id"] == "sjp:1"
+        pts = db.query("passing_time", where={"service_journey_id": "sj:1"}, order_by="order")
+        assert [pt["stop_point_id"] for pt in pts] == ["ssp:1", "ssp:2"]
+        assert pts[0]["departure_time"] == "06:30:00"
+        assert pts[1]["arrival_time"] == "06:42:00"
+
+    def test_multi_file_zip_with_timetable_first(self, db, tmp_path):
+        import zipfile
+        zip_path = tmp_path / "fluo_netex.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for name, content in _split_french_netex().items():
+                zf.writestr(name, content)
+        stats = NetexImporter().import_to_db(db, zip_path)
+        assert stats.get("service_journey", 0) == 2
+        assert stats.get("passing_time", 0) == 4
+
+    # (b) journey -> RouteRef -> LineRef, with no pattern reference at all
+    def test_line_resolved_through_route_on_the_journey(self, db, tmp_path):
+        content = FRENCH_PROFILE_NETEX.replace(
+            '<ServiceJourneyPatternRef ref="sjp:1"/>', '<RouteRef ref="route:1"/>')
+        stats = self._import(db, tmp_path, content, name="route_on_journey.xml")
+        # Passing times need the pattern's StopPointInJourneyPattern map, which
+        # a journey with no pattern reference cannot reach — the journeys
+        # themselves are what this indirection is about.
+        assert stats.get("service_journey", 0) == 2
+        assert {j["line_id"] for j in db.get_records("service_journey")} == {"line:1"}
+
+    # (c) pattern with no RouteRef, resolved backwards through its journeys —
+    # the pass-1 fallback, which only ever saw JourneyPatternRef
+    def test_pattern_line_resolved_from_service_journey_pattern_ref(self, db, tmp_path):
+        content = (FRENCH_PROFILE_NETEX
+                   .replace('<RouteRef ref="route:1"/>\n       <pointsInSequence>',
+                            '<pointsInSequence>')
+                   .replace('<ServiceJourneyPatternRef ref="sjp:1"/>',
+                            '<ServiceJourneyPatternRef ref="sjp:1"/>\n'
+                            '       <LineRef ref="line:1"/>'))
+        assert "<RouteRef" not in content, "the pattern must lose its RouteRef"
+        stats = self._import(db, tmp_path, content, name="no_route_ref.xml")
+        assert stats.get("journey_pattern", 0) == 1
+        assert stats.get("point_in_journey_pattern", 0) == 2
+        assert stats.get("service_journey", 0) == 2
+        assert stats.get("passing_time", 0) == 4
+
+    def test_unresolvable_line_still_skipped(self, db, tmp_path):
+        """The fallbacks must not turn a genuinely broken reference into data."""
+        content = FRENCH_PROFILE_NETEX.replace(
+            '<LineRef ref="line:1"/>', '<LineRef ref="line:ghost"/>')
+        stats = self._import(db, tmp_path, content, name="ghost.xml")
+        assert stats.get("service_journey", 0) == 0
+        assert stats.get("passing_time", 0) == 0
+
+
 # Swiss-SKI-style: no journey patterns; the stop sequence lives directly on
 # the ServiceJourney as calls/Call elements referencing ScheduledStopPoints.
 CALLS_NETEX = """<?xml version="1.0" encoding="UTF-8"?>
@@ -438,6 +643,167 @@ RICH_GTFS_RECORDS = {
     "transfers": [{"from_stop_id": "S1", "to_stop_id": "S2", "transfer_type": "2",
                    "min_transfer_time": "120"}],
 }
+
+
+# Four stops and nine shape points, so the polyline is split across three hops
+# rather than the single trivial one of RICH_GTFS_RECORDS.
+MULTIHOP_GTFS_RECORDS = {
+    "agency": [{"agency_id": "A1", "agency_name": "Test", "agency_url": "https://x.com",
+                "agency_timezone": "UTC"}],
+    "stops": [
+        {"stop_id": f"S{i}", "stop_name": f"Stop {i}",
+         "stop_lat": f"{40.0 + i * 0.3:.4f}", "stop_lon": f"{-74.0 - i * 0.3:.4f}",
+         "location_type": "0"}
+        for i in range(4)
+    ],
+    "routes": [{"route_id": "R1", "agency_id": "A1", "route_short_name": "1",
+                "route_long_name": "Route", "route_type": "3"}],
+    "calendar": [{"service_id": "WD", "monday": "1", "tuesday": "1", "wednesday": "1",
+                  "thursday": "1", "friday": "1", "saturday": "0", "sunday": "0",
+                  "start_date": "20260101", "end_date": "20261231"}],
+    "trips": [{"trip_id": "T1", "route_id": "R1", "service_id": "WD", "shape_id": "SH1"}],
+    "stop_times": [
+        {"trip_id": "T1", "stop_id": f"S{i}", "stop_sequence": str(i + 1),
+         "arrival_time": f"08:{i * 10:02d}:00", "departure_time": f"08:{i * 10:02d}:00"}
+        for i in range(4)
+    ],
+    # Nine points marching along the same diagonal the stops sit on, so each
+    # stop snaps to a distinct point (indices 0, 3, 6, 8).
+    "shapes": [
+        {"shape_id": "SH1", "shape_pt_lat": f"{40.0 + i * 0.1125:.4f}",
+         "shape_pt_lon": f"{-74.0 - i * 0.1125:.4f}", "shape_pt_sequence": str(i + 1)}
+        for i in range(9)
+    ],
+}
+
+
+class TestShapeGeometryOnServiceLinks:
+    """Shape geometry must ride on ServiceLinks — a JourneyPattern admits no
+    projections under the CEN XSD (roadmap task 9, `RESULTS.md` §3.6)."""
+
+    @pytest.fixture()
+    def exported(self, db, tmp_path):
+        zip_path = tmp_path / "feed.zip"
+        zip_path.write_bytes(make_gtfs_zip(MULTIHOP_GTFS_RECORDS))
+        GtfsImporter().import_to_db(db, zip_path)
+        netex_path = tmp_path / "out.xml"
+        NetexExporter(deduplicate_patterns=False).export_from_db(db, netex_path)
+        return db, netex_path, netex_path.read_text(encoding="utf-8")
+
+    def test_no_projections_on_journey_pattern(self, exported):
+        _db, _path, xml = exported
+        jp_block = xml.split("<journeyPatterns>")[1].split("</journeyPatterns>")[0]
+        assert "<projections>" not in jp_block
+        assert "<linksInSequence>" in jp_block
+
+    def test_one_service_link_per_hop(self, exported):
+        _db, _path, xml = exported
+        assert xml.count("<ServiceLink ") == 3          # 4 stops -> 3 hops
+        assert xml.count("<LinkSequenceProjection ") == 3
+        assert xml.count("<ServiceLinkInJourneyPattern ") == 3
+
+    def test_links_carry_their_endpoints(self, exported):
+        _db, _path, xml = exported
+        links = xml.split("<ServiceLink ")[1:]
+        pairs = [
+            (block.split('<FromPointRef ref="')[1].split('"')[0],
+             block.split('<ToPointRef ref="')[1].split('"')[0])
+            for block in links
+        ]
+        assert pairs == [("S0", "S1"), ("S1", "S2"), ("S2", "S3")]
+
+    def test_service_frame_children_are_in_schema_order(self, db, tmp_path):
+        """The CEN ServiceFrame is a sequence. A container in the wrong position
+        breaks the frame's content model, and then every id inside it fails to
+        register — one misplaced element cost 12 722 dangling-keyref errors."""
+        import xml.etree.ElementTree as ET
+
+        # RICH_GTFS_RECORDS has transfers, so <connections> is emitted too; the
+        # Porto feed has none, which is why its position went unnoticed.
+        zip_path = tmp_path / "feed.zip"
+        zip_path.write_bytes(make_gtfs_zip(RICH_GTFS_RECORDS))
+        GtfsImporter().import_to_db(db, zip_path)
+        netex_path = tmp_path / "ordered.xml"
+        NetexExporter(deduplicate_patterns=False).export_from_db(db, netex_path)
+
+        ns = "{http://www.netex.org.uk/netex}"
+        root = ET.parse(netex_path).getroot()
+        frame = root.find(f".//{ns}ServiceFrame")
+        assert frame is not None
+        emitted = [child.tag.replace(ns, "") for child in frame]
+
+        expected_order = ["lines", "scheduledStopPoints", "serviceLinks",
+                          "connections", "stopAssignments", "journeyPatterns"]
+        assert "connections" in emitted, "fixture must exercise the transfers path"
+        assert emitted == [tag for tag in expected_order if tag in emitted]
+
+    def test_gml_ids_are_ncnames_even_when_feed_ids_are_not(self, db, tmp_path):
+        """gml:id is xs:ID (an NCName); NeTEx object ids are far looser.
+
+        Real feeds exploit that difference — Porto's shape ids contain '|' — so
+        a gml:id must never be derived from a feed id verbatim. The tidy ids in
+        the other fixtures cannot catch this.
+        """
+        import re
+        import copy
+
+        records = copy.deepcopy(MULTIHOP_GTFS_RECORDS)
+        dirty = "603_0_1|0:x y"
+        records["trips"][0]["shape_id"] = dirty
+        records["trips"][0]["trip_id"] = "T|1"
+        for st in records["stop_times"]:
+            st["trip_id"] = "T|1"
+        for shp in records["shapes"]:
+            shp["shape_id"] = dirty
+
+        zip_path = tmp_path / "feed.zip"
+        zip_path.write_bytes(make_gtfs_zip(records))
+        GtfsImporter().import_to_db(db, zip_path)
+        netex_path = tmp_path / "dirty.xml"
+        NetexExporter(deduplicate_patterns=False).export_from_db(db, netex_path)
+
+        xml = netex_path.read_text(encoding="utf-8")
+        gml_ids = re.findall(r'gml:id="([^"]*)"', xml)
+        assert gml_ids, "the fixture must produce geometry"
+        ncname = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]*$")
+        assert all(ncname.match(gid) for gid in gml_ids), gml_ids
+        assert len(set(gml_ids)) == len(gml_ids), "gml:id must be unique"
+
+    def test_short_shape_yields_no_geometry_rather_than_degenerate_links(self):
+        """A LineString needs two points; too few and we emit nothing at all.
+
+        Emitting a one-point segment would put the export straight back to
+        failing the XSD, which is the whole reason this code exists.
+        """
+        from pid_transit.adapters.netex_exporter import _split_shape_by_stops
+
+        pts = [{"stop_point_id": f"S{i}"} for i in range(4)]
+        coords = {f"S{i}": (40.0 + i, -74.0 - i) for i in range(4)}
+        shape = [{"lat": 40.0 + i, "lon": -74.0 - i} for i in range(3)]
+
+        assert _split_shape_by_stops(shape, pts, coords) == []      # 3 points, 4 stops
+        assert _split_shape_by_stops(shape, pts[:1], coords) == []  # single stop
+        assert _split_shape_by_stops([], pts, coords) == []
+
+        # Exactly enough points is the tightest case that must still work.
+        exact = [{"lat": 40.0 + i * 0.5, "lon": -74.0 - i * 0.5} for i in range(4)]
+        segments = _split_shape_by_stops(exact, pts, coords)
+        assert len(segments) == 3
+        assert all(len(seg_points) >= 2 for _f, _t, seg_points in segments)
+
+    def test_round_trip_rebuilds_the_polyline_exactly(self, exported):
+        db, path, _xml = exported
+        db2 = TransmodelDatabase(":memory:")
+        NetexImporter().import_to_db(db2, path)
+
+        before = [(p["lat"], p["lon"]) for p in db.query("shape_point", order_by="sequence")]
+        after = [(p["lat"], p["lon"]) for p in db2.query("shape_point", order_by="sequence")]
+        assert len(before) == 9
+        assert after == before, "the split/reassembly must be loss-free"
+
+        sj = db2.get_one("service_journey", where={"id": "T1"})
+        assert sj["shape_id"] is not None
+        assert db2.count("shape_point", where={"shape_id": sj["shape_id"]}) == 9
 
 
 class TestCoverageSymmetryRoundTrip:
@@ -678,3 +1044,127 @@ class TestLegacyStopPlaceFallback:
         assert bad["lat"] is None and bad["lon"] is None
         good = db.get_one("scheduled_stop_point", where={"id": "sp:good"})
         assert (good["lat"], good["lon"]) == (47.4, 8.5)
+
+
+# Two patterns that share their first ServiceLink and then diverge, with link
+# ids in a producer's own scheme (no ":link:" separator). Regression: shape
+# identity was parsed out of the first link's id, so both patterns collapsed
+# onto one shape and jpB silently inherited jpA's geometry.
+def _foreign_links_netex(link_form: str = "projection") -> str:
+    """A feed whose ServiceLinks carry geometry in either legal form."""
+    def geometry(pos: str) -> str:
+        line = (f'<gml:LineString gml:id="g{abs(hash(pos)) % 9999}">'
+                f'<gml:posList>{pos}</gml:posList></gml:LineString>')
+        if link_form == "direct":
+            # gml:LineString straight on the Link, as the CEN LinkGroup allows.
+            return line
+        return (f'<projections><LinkSequenceProjection id="p" version="1">'
+                f'{line}</LinkSequenceProjection></projections>')
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<PublicationDelivery xmlns="http://www.netex.org.uk/netex"
+                     xmlns:gml="http://www.opengis.net/gml/3.2" version="1.1">
+ <dataObjects><CompositeFrame id="cf" version="1"><frames>
+  <ResourceFrame id="rf" version="1"><organisations>
+   <Operator id="op:1" version="1"><Name>Op</Name></Operator>
+  </organisations></ResourceFrame>
+  <SiteFrame id="sf" version="1"><stopPlaces>
+   {"".join(f'''<StopPlace id="sp:{s}" version="1"><Name>{s}</Name>
+     <Centroid><Location><Longitude>{i}.0</Longitude><Latitude>5{i}.0</Latitude></Location></Centroid>
+    </StopPlace>''' for i, s in enumerate("ABCD"))}
+  </stopPlaces></SiteFrame>
+  <ServiceFrame id="svf" version="1">
+   <lines><Line id="line:1" version="1"><Name>L</Name><TransportMode>bus</TransportMode>
+    <OperatorRef ref="op:1"/></Line></lines>
+   <scheduledStopPoints>
+    {"".join(f'<ScheduledStopPoint id="ssp:{s}" version="1"><Name>{s}</Name></ScheduledStopPoint>' for s in "ABCD")}
+   </scheduledStopPoints>
+   <stopAssignments>
+    {"".join(f'''<PassengerStopAssignment id="psa:{s}" version="1" order="{i+1}">
+      <ScheduledStopPointRef ref="ssp:{s}"/><StopPlaceRef ref="sp:{s}"/>
+     </PassengerStopAssignment>''' for i, s in enumerate("ABCD"))}
+   </stopAssignments>
+   <serviceLinks>
+    <ServiceLink id="ch:1:slink:AB" version="1">{geometry("50.0 0.0 50.5 0.5 51.0 1.0")}
+     <FromPointRef ref="ssp:A"/><ToPointRef ref="ssp:B"/></ServiceLink>
+    <ServiceLink id="ch:1:slink:BC" version="1">{geometry("51.0 1.0 51.5 1.5 52.0 2.0")}
+     <FromPointRef ref="ssp:B"/><ToPointRef ref="ssp:C"/></ServiceLink>
+    <ServiceLink id="ch:1:slink:BD" version="1">{geometry("51.0 1.0 59.9 9.9")}
+     <FromPointRef ref="ssp:B"/><ToPointRef ref="ssp:D"/></ServiceLink>
+   </serviceLinks>
+   <journeyPatterns>
+    {"".join(f'''<ServiceJourneyPattern id="jp:{n}" version="1">
+      <pointsInSequence>
+       {"".join(f'<StopPointInJourneyPattern id="spijp:{n}:{o}" version="1" order="{o}"><ScheduledStopPointRef ref="ssp:{s}"/></StopPointInJourneyPattern>' for o, s in enumerate(stops, start=1))}
+      </pointsInSequence>
+      <linksInSequence>
+       {"".join(f'<ServiceLinkInJourneyPattern id="sl:{n}:{o}" version="1" order="{o}"><ServiceLinkRef ref="{lk}"/></ServiceLinkInJourneyPattern>' for o, lk in enumerate(links, start=1))}
+      </linksInSequence>
+     </ServiceJourneyPattern>''' for n, stops, links in (
+        ("A", "ABC", ("ch:1:slink:AB", "ch:1:slink:BC")),
+        ("B", "ABD", ("ch:1:slink:AB", "ch:1:slink:BD")),
+     ))}
+   </journeyPatterns>
+  </ServiceFrame>
+  <ServiceCalendarFrame id="scf" version="1"><dayTypes>
+   <DayType id="dt:1" version="1"><properties><PropertyOfDay>
+    <DaysOfWeek>Monday</DaysOfWeek></PropertyOfDay></properties></DayType>
+  </dayTypes></ServiceCalendarFrame>
+  <TimetableFrame id="tf" version="1"><vehicleJourneys>
+   {"".join(f'''<ServiceJourney id="sj:{n}" version="1">
+     <DepartureTime>0{i+8}:00:00</DepartureTime>
+     <dayTypes><DayTypeRef ref="dt:1"/></dayTypes>
+     <ServiceJourneyPatternRef ref="jp:{n}"/><LineRef ref="line:1"/>
+    </ServiceJourney>''' for i, n in enumerate("AB"))}
+  </vehicleJourneys></TimetableFrame>
+ </frames></CompositeFrame></dataObjects>
+</PublicationDelivery>
+"""
+
+
+class TestServiceLinkGeometry:
+    """Shapes rebuilt from ServiceLinks, on ids this exporter did not write."""
+
+    def _imported(self, db, tmp_path, **kw):
+        path = tmp_path / "links.xml"
+        path.write_text(_foreign_links_netex(**kw), encoding="utf-8")
+        return db, NetexImporter().import_to_db(db, path)
+
+    def test_diverging_patterns_do_not_share_a_shape(self, db, tmp_path):
+        db, _ = self._imported(db, tmp_path)
+        shapes = {j["journey_pattern_id"]: j["shape_id"]
+                  for j in db.get_records("service_journey")}
+        assert shapes["jp:A"] != shapes["jp:B"]
+        assert all(shapes.values())
+
+    def test_each_pattern_keeps_its_own_geometry(self, db, tmp_path):
+        db, _ = self._imported(db, tmp_path)
+        by_shape = {}
+        for p in db.get_records("shape_point"):
+            by_shape.setdefault(p["shape_id"], []).append((p["sequence"], p["lat"], p["lon"]))
+        for pts in by_shape.values():
+            pts.sort()
+        # jpA: A->B->C is 5 points after dropping the shared junction;
+        # jpB: A->B->D is 4. The distinctive 59.9/9.9 tail must survive.
+        assert sorted(len(p) for p in by_shape.values()) == [4, 5]
+        assert any((59.9, 9.9) in [(lat, lon) for _s, lat, lon in pts]
+                   for pts in by_shape.values())
+
+    def test_direct_gml_linestring_is_read(self, db, tmp_path):
+        # The CEN LinkGroup admits gml:LineString straight on the Link, without
+        # a LinkSequenceProjection wrapper; many producers use that form.
+        db, _ = self._imported(db, tmp_path, link_form="direct")
+        assert db.count("shape_point") == 9
+        assert {j["shape_id"] for j in db.get_records("service_journey")} != {None}
+
+    def test_missing_link_geometry_is_logged(self, db, tmp_path, caplog):
+        import logging
+        xml = _foreign_links_netex().replace(
+            '<gml:posList>51.0 1.0 51.5 1.5 52.0 2.0</gml:posList>', '<gml:posList></gml:posList>')
+        path = tmp_path / "gap.xml"
+        path.write_text(xml, encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="pid_transit.adapters.netex_importer"):
+            NetexImporter().import_to_db(db, path)
+        assert any("no usable geometry" in r.getMessage() for r in caplog.records)
+        # The pattern that still has all its links keeps its shape.
+        assert db.count("shape_point") == 4

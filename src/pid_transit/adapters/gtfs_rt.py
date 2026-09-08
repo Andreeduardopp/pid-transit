@@ -14,7 +14,6 @@ Requires the optional `rt` extra: `pip install pid-transit[rt]`
 """
 
 import json
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -240,6 +239,8 @@ def fetch_snapshot(
     """
     src = str(source)
     if src.startswith(("http://", "https://")):
+        import urllib.request  # deferred: only the URL path needs the http stack
+
         request = urllib.request.Request(src, headers=headers or {})
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:

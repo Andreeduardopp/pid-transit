@@ -10,17 +10,26 @@ import logging
 from pathlib import Path
 from typing import Dict, Union
 
-try:
-    import openpyxl
-    HAS_OPENPYXL = True
-except ImportError:
-    HAS_OPENPYXL = False
-
 from ..core.database import TransmodelDatabase
 from ..core.schemas import TRANSMODEL_ENTITIES
 from ..core.exceptions import ImportFailedError
 
 logger = logging.getLogger(__name__)
+
+
+def _load_openpyxl():
+    """Import openpyxl on demand.
+
+    Only the xlsx path needs it, so importing this module - or running a CSV
+    import - must not pay for it.
+    """
+    try:
+        import openpyxl
+    except ImportError as e:
+        raise ImportFailedError(
+            "openpyxl is required to import Excel files. Install via 'pip install openpyxl'"
+        ) from e
+    return openpyxl
 
 class SpreadsheetImporter:
     """
@@ -50,8 +59,7 @@ class SpreadsheetImporter:
         stats: Dict[str, int] = {}
 
         if self.format == "xlsx":
-            if not HAS_OPENPYXL:
-                raise ImportFailedError("openpyxl is required to import Excel files. Install via 'pip install openpyxl'")
+            openpyxl = _load_openpyxl()
             if not path.is_file() or path.suffix.lower() != ".xlsx":
                 raise ImportFailedError(f"Expected a valid .xlsx file, got {path}")
 

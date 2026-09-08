@@ -177,3 +177,8 @@ uv.lock
 # Benchmarks, comparative studies, external validator tooling, test feeds,
 # API probe dumps, thesis material. See research/README.md.
 research/
+
+# Spec Kit — ferramenta de desenvolvimento local, não faz parte da biblioteca.
+# Config, templates, scripts e a constituição do projeto. Reinstalável com
+# `specify init --here`. As skills correspondentes já saem por .claude/.
+.specify/
