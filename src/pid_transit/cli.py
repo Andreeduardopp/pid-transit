@@ -19,7 +19,10 @@ def cmd_import(args):
         importer = GtfsImporter(fallback_timezone=args.timezone)
     elif fmt == "netex":
         from .adapters.netex_importer import NetexImporter
-        importer = NetexImporter(fallback_timezone=args.timezone)
+        importer = NetexImporter(
+            fallback_timezone=args.timezone,
+            profile=getattr(args, "profile", None),
+        )
     elif fmt == "csv":
         from .adapters.spreadsheet_importer import SpreadsheetImporter
         importer = SpreadsheetImporter(format="csv")
@@ -31,9 +34,20 @@ def cmd_import(args):
         sys.exit(1)
 
     stats = dataset.import_data(importer, args.source)
+    from .adapters.netex_importer import LOSS_PREFIXES
+
+    imported = {k: v for k, v in stats.items() if not k.startswith(LOSS_PREFIXES)}
+    lost = {k: v for k, v in stats.items() if k.startswith(LOSS_PREFIXES)}
     print("Import complete:")
-    for table, count in sorted(stats.items()):
+    for table, count in sorted(imported.items()):
         print(f"  {table}: {count:,}")
+    if lost:
+        # Printed apart from the table counts because it is the opposite
+        # claim: these are things the file contained and the database
+        # does not.
+        print("Not imported:")
+        for reason, count in sorted(lost.items()):
+            print(f"  {reason}: {count:,}")
 
 
 def cmd_export(args):
@@ -350,6 +364,10 @@ def cmd_diff(args):
 
 
 def main():
+    # Local, like every other adapter import here: it keeps `--help` from
+    # pulling the adapters in. This one is a plain enum module with no deps.
+    from .adapters.netex_profiles import NetexProfile
+
     parser = argparse.ArgumentParser(
         prog="pid-transit",
         description="PID-Transit: Transit data management CLI",
@@ -364,6 +382,10 @@ def main():
                           help="Input format")
     p_import.add_argument("--db", required=True, help="Path to SQLite database")
     p_import.add_argument("--timezone", default="UTC", help="Fallback timezone")
+    p_import.add_argument("--profile", default=None,
+                          choices=[p.value for p in NetexProfile],
+                          help="Force a NeTEx dialect instead of detecting one "
+                               "from the document's shape (netex only)")
     p_import.set_defaults(func=cmd_import)
 
     # export

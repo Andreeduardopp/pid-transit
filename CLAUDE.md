@@ -56,6 +56,26 @@ before tasks are generated. A fresh clone will not have it — reinstall with
   memoize (past defects: NeTEx journey-pattern rescan, validator V16/V18).
 - Stream, don't materialize: `iterparse` / generators / cursor iteration on any
   path that touches a whole feed. Peak RSS must not scale with input size.
+- **A dialect is a subclass, not a branch.** When a format's national profile,
+  version or vendor variant needs reading differently, add a subclass with the
+  method it needs — never another `if profile is X` inside a function the other
+  variants run through. The base class answers "nothing to do" to every hook, so
+  a new variant cannot change how the existing ones are read; that inertness is
+  the safety property, and it is what a test should assert. If a variant needs a
+  seam that does not exist, add the seam to the base with an inert default and
+  override it in the one subclass. `adapters/netex_profiles.py` is the worked
+  example (`ProfileAdapter` + `NetexProfile`).
+- Detect a variant from the document's **structure**, never from a codespace, a
+  file name or an id prefix — those are labels the producer chose. Group what
+  belongs together by XML containment, not by a shared id suffix, and fire the
+  rule on the shape of *most* entities rather than the first element that
+  matches: real feeds carry strays. (Past defect: sibling `ServiceCalendar`
+  matched to its `DayType` by trailing id segment, which also silently assumed
+  one of the two nestings CEN allows.)
+- What an import could not read belongs in its **return value**, not only in a
+  `logger.warning`. Losses travel in the stats dict under the `skipped_` /
+  `dropped_` prefixes, so a caller can ask "what did you lose?" and get a
+  number. Zero adds no key.
 - Performance-relevant changes are measured (wall + peak RSS) on a
   production-size feed against `research/benchmark/METRICS.md`, not on fixtures.
   Report DB size and peak RSS separately — they are not the same number.

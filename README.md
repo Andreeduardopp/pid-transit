@@ -6,24 +6,138 @@ A professional transit data library based on the Transmodel / NeTEx conceptual m
 
 - **Transmodel Core Database**: Underlying SQLite database modeled accurately against European transit standards (Transmodel).
 - **Object-Oriented API**: Manage your datasets via the `TransitDataset` facade and clean Repository classes with filtered queries and incremental updates.
-- **Strong Typing**: Full Pydantic v2 validation for all 13 entity types (`Operator`, `Line`, `ScheduledStopPoint`, `ServiceJourney`, `ShapePoint`, `Transfer`, etc.).
+- **Strong Typing**: Full Pydantic v2 validation for all 20 entity types (`Operator`, `Line`, `ScheduledStopPoint`, `Pathway`, `ServiceJourney`, `ShapePoint`, `Transfer`, `FareAttribute`, etc.).
 - **Query & Filtering**: Filtered queries, lookups by ID, field-based search, counting, and ordered results across all repositories.
-- **Full GTFS Coverage**: Imports and exports all standard GTFS files including `shapes.txt`, `frequencies.txt`, `transfers.txt`, `feed_info.txt`, and accessibility fields (`wheelchair_boarding`, `wheelchair_accessible`, `bikes_allowed`).
-- **NeTEx Round-Trip**: Full import and export of NeTEx XML with XSD-compliant output, journey pattern deduplication, and DayOffset handling for overnight services.
+- **Full GTFS Coverage**: Imports and exports 17 GTFS files, including `shapes.txt`, `frequencies.txt`, `transfers.txt`, `pathways.txt`, `levels.txt`, `translations.txt`, `attributions.txt`, `fare_attributes.txt`, `fare_rules.txt`, `feed_info.txt`, and accessibility fields (`wheelchair_boarding`, `wheelchair_accessible`, `bikes_allowed`).
+- **NeTEx Round-Trip**: Full import and export of NeTEx XML, validated against the CEN NeTEx 1.3 XSD with **zero schema errors**, with journey pattern deduplication and DayOffset handling for overnight services.
 - **Analytics**: Built-in operational statistics (headways, vehicle-hours, service spans, stop coverage), feed comparison/diff, and GTFS-RT readiness checks.
+- **GTFS-Realtime**: Fetch and parse TripUpdate / VehiclePosition / Alert feeds, then match them against the static dataset to report trip and stop resolution rates and delay distributions.
 - **Multi-Feed Merge**: Combine feeds from different operators with ID namespacing and Haversine-based stop deduplication.
-- **CLI Tool**: Command-line interface for import, export, validate, stats, and diff operations.
+- **CLI Tool**: Nine commands — `import`, `export`, `validate`, `stats`, `diff`, `merge`, `normalize`, `frequencies`, and the `rt-*` real-time checks.
 - **Spreadsheet Import**: Load transit data directly from Excel workbooks or CSV folders.
-- **Data Validation**: Logical consistency checks on the Transmodel database (FK integrity, required fields, passing time order).
+- **Data Validation**: 20 rules over the Transmodel database — V01–V15 structural (FK integrity, required fields, passing-time order) and V16–V20 semantic (implied-speed plausibility, duplicate stops, orphan inventory, frequency sanity), filterable by severity.
+- **NeTEx Profile Detection**: National profiles differ enough to break naive readers. The importer identifies the dialect from the document's structure and adapts — CEN/EPIP-generic, Swiss SKI, the French/European indirection, and the Portuguese IMT profile. See [NeTEx profiles](#netex-profiles).
+- **Streaming Import**: Two-pass `iterparse` with element pruning — peak memory stays flat regardless of feed size. See [Performance](#performance).
 
 ## Installation
 
-Once packaged, install via pip:
 ```bash
-pip install pid-transit
+pip install pid-transit          # core
+pip install pid-transit[rt]      # + GTFS-Realtime support
 ```
 
-*Note: Python 3.10+ is required. Dependencies: `pydantic>=2.0`, `openpyxl>=3.0`.*
+*Python 3.10 through 3.14. Runtime dependencies are deliberately minimal — `pydantic>=2.0`
+and `openpyxl>=3.0`. GTFS-Realtime support is the optional `rt` extra; the library imports
+without it.*
+
+## Performance
+
+Measured, not estimated. Every figure below comes from a timed run on a named feed; the
+method and the full result set live in `research/benchmark/METRICS.md`.
+
+**How these were taken.** Each phase runs in its own process, sequentially, on an
+otherwise idle machine. *Wall* is `time.perf_counter` around the adapter call, *CPU* is
+`time.process_time`, and *peak RSS* is the process high-water mark (`psutil.peak_wset`),
+which includes the ~30 MB CPython floor. Short phases are repeated and averaged; long
+ones run once. Hardware: Intel Core Ultra 7 265H (16 cores), 31.5 GB RAM, NVMe SSD,
+Windows 11, CPython 3.12.1, single-threaded throughout.
+
+**Database size and peak memory are different numbers and are reported separately.** A
+feed that produces an 8.6 GB database is still imported inside 1.2 GB of RAM.
+
+### Import
+
+| Feed | Input | Wall | CPU | Peak RSS | Database |
+|---|---|---:|---:|---:|---:|
+| Porto GTFS | 5.1 MB zip | 32.1 s | 29.0 s | 557 MB | 104.4 MB |
+| Porto NeTEx (own dialect) | 151.4 MB XML | 38.1 s | 34.5 s | **80 MB** | 57.9 MB |
+| Carris NeTEx (IMT, PT profile) | 173.6 MB XML | 21.9 s | 18.9 s | **149 MB** | 31.9 MB |
+| Swiss NeTEx subset (6 files) | 630 MB XML | 251.4 s | 195.9 s | 1,171 MB | 516.6 MB |
+| Swiss NeTEx full (355 files) | 420 MB zip / **24.5 GB XML** | 6,501 s (108.4 min) | 2,751 s | **1,171 MB** | 8.64 GB |
+
+The last two rows are the point of the table: input grew **39×** (630 MB → 24.5 GB) and
+peak memory did not move at all. Importers stream — a two-pass `iterparse` with element
+pruning, flushing to SQLite every 5,000 rows — so memory tracks the lookup maps, not the
+feed. The full Swiss run is disk-bound rather than CPU-bound (CPU is 42% of wall) once
+the 8.6 GB database outgrows the page cache.
+
+Swiss full feed output: 1.66 M service journeys, 26.5 M passing times, 67,183 stops,
+3.7 M calendar exceptions.
+
+### Export
+
+| Feed | Source | Wall | CPU | Peak RSS | Output |
+|---|---|---:|---:|---:|---:|
+| Porto → GTFS | 104.4 MB db | 12.7 s | 12.2 s | 646 MB | 5.0 MB zip |
+| Porto → NeTEx | 104.4 MB db | 45.7 s | 42.7 s | 958 MB | 151.4 MB XML |
+| Swiss subset → GTFS | 516.6 MB db | 31.7 s | 30.8 s | 2,900 MB | 14.4 MB zip |
+| Swiss subset → NeTEx | 516.6 MB db | 156.6 s | 146.8 s | **5,238 MB** | 1.18 GB XML |
+
+**Known limitation, stated plainly:** the exporters buffer their whole output before
+writing, so export memory scales with output size — 5.2 GB peak for a 1.18 GB NeTEx file,
+against 1.17 GB flat to import the same data. A full-Swiss export would exhaust 32 GB of
+RAM. Import at national scale today; budget accordingly on large exports. Streaming
+exporters are the next performance item on the roadmap.
+
+### Startup
+
+`import pid_transit` costs **27.7 ms** and loads 29 modules (was 649.4 ms / 453 modules
+before the public API was made lazy). Neither `openpyxl` nor `urllib.request` is pulled
+in by a bare import — each loads only when the capability that needs it is used, and a
+test asserts it in a fresh interpreter.
+
+## Conformance
+
+Three different claims, deliberately kept apart, because they have different strengths:
+whether output is **schema-valid**, whether a round-trip is **lossless**, and whether the
+data is **semantically consistent**.
+
+### Schema validity — external validators, not our own opinion
+
+| Target | Validator | Result |
+|---|---|---|
+| Exported GTFS | MobilityData `gtfs-validator` v8.0.0 | **PASS, 0 errors** (5,603 warnings vs 5,599 in the source feed) |
+| Exported NeTEx | CEN NeTEx 1.3 XSD | **PASS, 0 errors** |
+| Source GTFS (control) | MobilityData `gtfs-validator` v8.0.0 | PASS, 0 errors, 5,599 warnings |
+
+The warning-profile match matters more than the error count: an exported feed that
+reproduces the original's warnings almost exactly (5,603 vs 5,599) is preserving what the
+operator supplied rather than silently normalising it. A system of record should not
+"improve" its input.
+
+Conformance is re-validated per release rather than assumed. The 0.7.0 re-check caught the
+NeTEx exporter having drifted to 2,771 schema errors through changes made for third-party
+interoperability that were never re-validated; all were fixed, and the regression tests
+that now cover them are the reason the claim above can be made. The full audit trail is in
+`research/benchmark/RESULTS.md`.
+
+Re-run it yourself:
+
+```bash
+python research/validator/run_validation.py --input path/to/feed.zip
+```
+
+*(The XSD step needs `lxml`, which is a harness dependency — the library itself still
+depends only on `pydantic` and `openpyxl`.)*
+
+### Round-trip fidelity
+
+GTFS → NeTEx → GTFS is lossless. With pattern deduplication disabled, **all ten entity
+counts match the source exactly**, including 91,850 shape points reassembled from per-hop
+`ServiceLink` geometry. `tests/test_roundtrip.py` guards this in both directions on every
+commit.
+
+Two documented exceptions: `bikes_allowed` is GTFS-only and has no NeTEx equivalent, and
+shape cut positions are approximated when a polyline is split per hop (the cut is
+reversible; the positions are chosen, not recovered).
+
+### Semantic validation
+
+Schema validity says a file parses. It does not say the data makes sense. `dataset.validate()`
+runs 20 rules over the imported database — V01–V15 structural, V16–V20 semantic (implied
+travel speed per mode, pattern/passing-time agreement, duplicate stops within 10 m, orphan
+inventory, frequency sanity) — filterable by severity so a CI gate can fail on errors
+while tolerating advisories. Details in [Data Validation](#data-validation).
 
 ## Quickstart
 
@@ -159,6 +273,44 @@ The NeTEx importer parses all standard frames: `ResourceFrame` (operators), `Sit
 
 Multi-file datasets are imported in two streaming passes (reference data first, then service journeys), so entities may reference each other across files in any order and peak memory stays flat regardless of feed size. Stop coordinates resolve through `PassengerStopAssignment` → `Quay`/`StopPlace`, matching production feeds such as the Swiss national timetable.
 
+#### NeTEx profiles
+
+NeTEx is a large standard, and national profiles use different corners of it. Two feeds
+can both be valid CEN NeTEx and still need different readers. The importer identifies the
+dialect from the **structure of the document** — never from a codespace or a file name,
+which are labels a producer chose and can change — and adapts:
+
+| Profile | Recognised by | What it needs |
+|---|---|---|
+| `GENERIC` | Standalone `JourneyPattern`, `passingTimes`, journeys with their own `id` | CEN/EPIP baseline — what this library exports |
+| `SWISS_SKI` | `AvailabilityCondition` calendars plus inline `calls` | Validity windows with day bitmasks instead of `DayType` |
+| `EUROPEAN` | Journeys naming only a pattern, never a line | Line resolved two hops up, via the pattern's `Route` |
+| `PORTUGUESE` | Journeys with **no `id` at all** plus an inline `JourneyPatternView` | Synthesised journey ids, and calendars paired by document order |
+
+```python
+importer = NetexImporter()                     # detect (default)
+importer = NetexImporter(profile="portuguese") # or force it
+dataset.import_data(importer, "netex.zip")
+print(importer.last_profile)                   # NetexProfile.PORTUGUESE
+```
+
+Detection is logged at INFO with the evidence behind it, so a wrong guess is diagnosable
+rather than mysterious, and `profile=` overrides it outright.
+
+**Worked example — the Portuguese national profile.** The IMT's published Carris dataset
+(173.6 MB of XML) writes `ServiceJourney` elements carrying *no attributes at all*, an
+inline `JourneyPatternView` instead of a `JourneyPattern`, and one `ServiceCalendarFrame`
+per journey with no reference between the two. Read as generic NeTEx, the network imports
+and the entire timetable silently disappears. Read as `PORTUGUESE`, all 10,238 journeys
+and 296,603 passing times import with real calendars, in 21.9 s at 149 MB peak RSS.
+
+Where a profile forces an inference rather than a reading, the importer says so and
+refuses to guess. The Portuguese journey-to-calendar pairing is positional — the only
+interpretation the file permits — so it is applied **only** when the two counts match
+exactly; otherwise it warns and imports the journeys without a calendar rather than
+attaching a plausible wrong one. Journeys that genuinely cannot be read are counted and
+reported, never dropped in silence.
+
 For long-running conversions the importers accept a progress callback and a cancel event (both optional, also on `GtfsImporter`):
 
 ```python
@@ -185,7 +337,7 @@ exporter = GtfsExporter(include_shapes=True)
 dataset.export_data(exporter, "output_feed.zip")
 ```
 
-The exporter writes all standard GTFS files: `agency.txt`, `routes.txt`, `stops.txt`, `calendar.txt`, `calendar_dates.txt`, `trips.txt`, `stop_times.txt`, `shapes.txt`, `frequencies.txt`, `transfers.txt`, and `feed_info.txt`. Accessibility fields (`wheelchair_boarding`, `wheelchair_accessible`, `bikes_allowed`) are included automatically when present.
+The exporter writes 17 GTFS files: `agency.txt`, `routes.txt`, `stops.txt`, `calendar.txt`, `calendar_dates.txt`, `trips.txt`, `stop_times.txt`, `shapes.txt`, `frequencies.txt`, `transfers.txt`, `pathways.txt`, `levels.txt`, `translations.txt`, `attributions.txt`, `fare_attributes.txt`, `fare_rules.txt`, and `feed_info.txt`. Accessibility fields (`wheelchair_boarding`, `wheelchair_accessible`, `bikes_allowed`) are included automatically when present.
 
 ### Exporting to NeTEx
 
@@ -194,13 +346,18 @@ from pid_transit import TransitDataset, NetexExporter
 
 dataset = TransitDataset("my_city.db")
 exporter = NetexExporter(
-    profile="EPIP",
+    profile="EPIP",             # accepted but currently inert — see note below
     deduplicate_patterns=True,  # reduces output size significantly
     compress=False,             # set True for .gz output
 )
 
 dataset.export_data(exporter, "output_netex.xml")
 ```
+
+> **Note:** `profile` is accepted but has no effect yet. The exporter emits generic CEN
+> NeTEx 1.3, not a profile-constrained document. Profile-aware export (EPIP and national
+> profiles) is planned, not shipped — if your National Access Point enforces a profile,
+> validate the output against that profile before submitting.
 
 The `deduplicate_patterns` option groups journey patterns with identical stop sequences (same line, direction, and ordered stops), writing only canonical patterns and remapping references. This can reduce NeTEx output from thousands of duplicate patterns to a few hundred unique ones.
 
@@ -282,7 +439,7 @@ print(report.to_dict())
 print(report.to_markdown())
 ```
 
-The differ compares all 13 entity types (both ID-based and composite-key tables) and detects service span changes by leveraging the statistics module.
+The differ compares all 20 entity types (12 ID-keyed tables and 8 composite-key tables) and detects service span changes by leveraging the statistics module.
 
 ### Multi-Feed Merge
 
@@ -324,6 +481,36 @@ print(report.to_markdown())
 ```
 
 The report provides both structured (`to_dict()`) and human-readable (`to_markdown()`) output, listing all passed checks and any issues found with their category, entity type, and ID.
+
+### Matching a Live GTFS-Realtime Feed
+
+Readiness checks the static side; matching checks the live one. The most common failure in
+production is a real-time feed referencing `trip_id`s the static feed no longer contains —
+this reports that as a resolution rate rather than a silent gap. Requires the `rt` extra.
+
+```python
+from pid_transit import TransitDataset, fetch_snapshot, match_snapshot
+
+dataset = TransitDataset("my_city.db")
+
+# Accepts a URL or a local .pb path; `headers` carries the API key many feeds require
+snapshot = fetch_snapshot(
+    "https://example.org/gtfs-rt.pb",
+    headers={"X-Access-Token": "..."},
+    timeout=30.0,
+)
+
+report = match_snapshot(snapshot, dataset)
+print(f"{report.match_rate:.1%} of RT trips resolve against the static feed")
+print(report.delay_summary())
+# {'count': 812, 'avg_secs': 84.2, 'min_secs': -120, 'max_secs': 940}
+print(report.to_markdown())
+```
+
+`parse_feed(data: bytes)` parses an already-fetched payload, for when you manage the HTTP
+call yourself. `RtSnapshot` and its entities (`RtTripUpdate`, `RtVehiclePosition`,
+`RtAlert`) are ordinary Pydantic models, so a snapshot can be persisted, serialized, or
+diffed like any other object.
 
 ### Frequency Expansion & Compression
 
@@ -372,10 +559,29 @@ else:
         print(f"[{issue.entity_type}] {issue.entity_id}: {issue.message}")
 ```
 
-Checks include:
-- Every `ServiceJourney` has at least one `PassingTime`
-- No duplicate passing time order within a journey
-- Every `Line` has at least one `JourneyPattern`
+The validator runs 20 rules. **V01–V15** cover structural integrity: every `ServiceJourney`
+has at least one `PassingTime`, no duplicate passing-time order, arrival times non-decreasing
+along a journey, every `Line` has a `JourneyPattern` and at least one `ServiceJourney`,
+foreign keys resolve (stops, day types, journey patterns, pathways, frequencies), `DayType`
+date ranges are ordered, coordinates are plausible, and the feed's date coverage is sane.
+
+**V16–V20** add semantic checks that structural validation cannot catch:
+
+| Rule | Check |
+|---|---|
+| V16 | Implied travel speed between consecutive stops exceeds a per-mode ceiling (Haversine) |
+| V17 | Journey pattern and passing-time sequences disagree |
+| V18 | Two stops share a normalized name within 10 m of each other |
+| V19 | Orphan inventory — entities that nothing references |
+| V20 | Frequency window sanity (headway sign, start/end ordering) |
+
+Filter by severity to keep a CI gate tight without drowning in advisories:
+
+```python
+from pid_transit.core.validator import Severity
+
+report = dataset.validate(min_severity=Severity.ERROR)
+```
 
 ## Command-Line Interface
 
@@ -392,8 +598,9 @@ pid-transit import netex.xml --format netex --db city.db --timezone Europe/Lisbo
 pid-transit import data.xlsx --format xlsx --db city.db
 pid-transit import csv_folder/ --format csv --db city.db
 
-# Export to GTFS (with shapes)
-pid-transit export --db city.db --format gtfs --output export.zip --include-shapes
+# Export to GTFS (shapes.txt is included by default)
+pid-transit export --db city.db --format gtfs --output export.zip
+pid-transit export --db city.db --format gtfs --output export.zip --no-shapes
 
 # Export to NeTEx (with deduplication, optional gzip)
 pid-transit export --db city.db --format netex --output export.xml
@@ -406,8 +613,17 @@ pid-transit export --db city.db --format netex --output export.xml --no-dedup
 pid-transit frequencies city.db --expand
 pid-transit frequencies city.db --compress --min-run 3
 
-# Run logical validation
+# Normalize journey patterns (deduplicate identical stop sequences)
+pid-transit normalize city.db --patterns
+
+# Merge feeds from several operators into one database
+pid-transit merge regional.db --source stcp.db --namespace stcp \
+                              --source metro.db --namespace metro \
+                              --dedupe-stops --distance 50
+
+# Run logical validation (exit non-zero on errors — use this as a CI gate)
 pid-transit validate city.db
+pid-transit validate city.db --min-severity error --json
 
 # Show dataset statistics
 pid-transit stats city.db
@@ -417,6 +633,11 @@ pid-transit stats city.db --line L_10 --day-type WEEKDAY
 pid-transit diff january.db february.db
 pid-transit diff january.db february.db --output report.md
 pid-transit diff january.db february.db --output report.json
+
+# GTFS-Realtime: static readiness, live snapshot, and static-vs-RT matching
+pid-transit rt-readiness city.db --json
+pid-transit rt-snapshot https://example.org/gtfs-rt.pb --db city.db --min-match-rate 0.95
+pid-transit rt-check feed.zip --format gtfs --output rt_report.md
 ```
 
 ## Data Model
@@ -428,6 +649,9 @@ PID-Transit implements the following Transmodel entities:
 | `Operator` | `agency` | Transit operator/agency |
 | `Line` | `route` | A public transport line |
 | `ScheduledStopPoint` | `stop` | A stop location with coordinates and wheelchair boarding info |
+| `StopArea` | `stops` (station) | A grouping of stop points — station, entrance, or generic node |
+| `Level` | `levels` | A floor within a station, for multi-level pathfinding |
+| `Pathway` | `pathways` | A walkable link between stop points, entrances, and levels |
 | `DayType` | `calendar` | Weekly service pattern with validity period |
 | `OperatingDayException` | `calendar_dates` | Date-specific service additions/removals |
 | `JourneyPattern` | *(derived from trip)* | Ordered sequence of stops for a route variant |
@@ -438,13 +662,18 @@ PID-Transit implements the following Transmodel entities:
 | `ShapePoint` | `shapes` | Route geometry as ordered lat/lon points |
 | `Frequency` | `frequencies` | Headway-based service definition |
 | `Transfer` | `transfers` | Stop-to-stop transfer rules and minimum times |
+| `FareAttribute` | `fare_attributes` | Fare price, currency, and transfer allowance |
+| `FareRule` | `fare_rules` | Which fare applies to which route, zone, or origin/destination |
+| `Translation` | `translations` | Per-field translations for any table |
+| `Attribution` | `attributions` | Data provenance and producer credits |
 
 ### Transport Modes
 
 ```python
 from pid_transit import TransportMode
 
-# Available modes: BUS, TRAM, RAIL, METRO, FERRY, CABLE_CAR, OTHER
+# Available modes: BUS, TRAM, RAIL, METRO, FERRY, CABLE_CAR, GONDOLA,
+#                  FUNICULAR, TROLLEYBUS, MONORAIL, OTHER
 ```
 
 ### Direction Types
@@ -483,16 +712,21 @@ pid_transit/
   cli.py                   # Command-line interface
   core/
     database.py            # SQLite wrapper (TransmodelDatabase)
-    schemas.py             # Pydantic models for all 13 entities
+    schemas.py             # Pydantic models for all 20 entities
     repositories.py        # Repository pattern with CRUD + queries
     dataset.py             # TransitDataset facade
-    validator.py           # Logical consistency checks
+    validator.py           # 20 structural + semantic consistency rules
+    geo.py                 # Haversine and the spatial StopGrid index
+    patterns.py            # Journey pattern normalization/deduplication
+    frequencies.py         # Frequency expansion and compression
     exceptions.py          # Custom exception types
   adapters/
     gtfs_importer.py       # GTFS ZIP -> database
     gtfs_exporter.py       # Database -> GTFS ZIP
-    netex_importer.py      # NeTEx XML -> database
+    netex_importer.py      # NeTEx XML -> database (streaming, two-pass)
     netex_exporter.py      # Database -> NeTEx XML
+    netex_profiles.py      # NeTEx dialects and structural profile detection
+    gtfs_rt.py             # GTFS-Realtime fetch, parse, and static matching
     spreadsheet_importer.py # Excel/CSV -> database
   analytics/
     statistics.py          # Operational metrics (headways, vehicle-hours, etc.)
@@ -525,7 +759,7 @@ pip install pid-transit[dev]
 pytest
 ```
 
-The test suite includes 152 tests covering all modules: database CRUD, schema validation, GTFS/NeTEx import/export round-trips, repository operations, statistics, feed diff, multi-feed merge, GTFS-RT readiness, and CLI commands.
+The test suite includes 330 tests covering all modules: database CRUD, schema validation, GTFS/NeTEx import/export round-trips, NeTEx profile detection, repository operations, statistics, feed diff, multi-feed merge, GTFS-RT parsing and readiness, frequency expansion, and CLI commands. `tests/test_roundtrip.py` specifically guards format fidelity in both directions. Without the optional `rt` extra, 312 run and the 18 GTFS-Realtime tests skip.
 
 ## License
 

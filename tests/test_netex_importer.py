@@ -6,7 +6,20 @@ from pid_transit.core.database import TransmodelDatabase
 from pid_transit.adapters.gtfs_importer import GtfsImporter
 from pid_transit.adapters.gtfs_exporter import GtfsExporter
 from pid_transit.adapters.netex_exporter import NetexExporter
-from pid_transit.adapters.netex_importer import NetexImporter
+from pid_transit.adapters.netex_importer import (
+    LOSS_JOURNEY_NO_ID,
+    LOSS_JOURNEY_NO_LINE,
+    LOSS_PREFIXES,
+    NetexImporter,
+)
+from pid_transit.adapters.netex_profiles import (
+    CalendarFrame,
+    MAX_CONDITIONS_PER_FRAME,
+    NetexProfile,
+    ProfileAdapter,
+    ProfileEvidence,
+    make_adapter,
+)
 from tests.conftest import make_gtfs_zip
 
 
@@ -1168,3 +1181,451 @@ class TestServiceLinkGeometry:
         assert any("no usable geometry" in r.getMessage() for r in caplog.records)
         # The pattern that still has all its links keeps its shape.
         assert db.count("shape_point") == 4
+
+
+# ---------------------------------------------------------------------------
+# Portuguese profile (roadmap task 9): IMT How2Go / transporlis
+# ---------------------------------------------------------------------------
+
+def _pt_calendar_frame(key: str, days: str = "Monday Tuesday",
+                       conditions=(), nested: bool = False) -> str:
+    """One ServiceCalendarFrame per journey, the way the Carris feed emits it:
+    dates on the ServiceCalendar, weekdays on a DayType with no ValidBetween.
+
+    `conditions` are (date, is_available) pairs, written as the single-date
+    AvailabilityConditions this profile uses for calendar exceptions. `nested`
+    puts the dayTypes inside the ServiceCalendar instead of beside it -- the
+    other order CEN allows, which reverses the order the two end events arrive
+    in.
+    """
+    day_types = f"""     <dayTypes>
+      <DayType id="dt:{key}" version="any">
+       <Name>{key}</Name>
+       <properties><PropertyOfDay><DaysOfWeek>{days}</DaysOfWeek></PropertyOfDay></properties>
+      </DayType>
+     </dayTypes>"""
+    dates = """      <FromDate>2022-01-17</FromDate>
+      <ToDate>2022-04-08</ToDate>"""
+    if nested:
+        calendar = f"""     <ServiceCalendar id="sc:{key}">
+{dates}
+{day_types}
+     </ServiceCalendar>"""
+    else:
+        calendar = f"""     <ServiceCalendar id="sc:{key}">
+{dates}
+     </ServiceCalendar>
+{day_types}"""
+    validity = ""
+    if conditions:
+        entries = "\n".join(
+            f"""      <AvailabilityCondition id="ac:{key}{date}">
+       <FromDate>{date}T00:00:00</FromDate>
+       <ToDate>{date}T00:00:00</ToDate>
+       <IsAvailable>{'true' if available else 'false'}</IsAvailable>
+      </AvailabilityCondition>"""
+            for date, available in conditions
+        )
+        validity = f"""
+     <contentValidityConditions>
+{entries}
+     </contentValidityConditions>"""
+    return f"""    <ServiceCalendarFrame id="scf:{key}" version="1.0">{validity}
+{calendar}
+    </ServiceCalendarFrame>"""
+
+
+def _pt_journey(line, stop_a: str, stop_b: str, t1: str, t2: str) -> str:
+    """A ServiceJourney exactly as the Carris feed writes it: no attributes at
+    all, an inline JourneyPatternView, and stop times as calls.
+
+    `line=None` omits the direct LineRef, leaving the RouteRef nested inside the
+    JourneyPatternView as the only way to reach the line.
+    """
+    line_ref = f'<LineRef ref="{line}"/>' if line else ""
+    return f"""      <ServiceJourney>
+       {line_ref}
+       <DirectionType>outbound</DirectionType>
+       <JourneyPatternView><RouteRef ref="route:1"/></JourneyPatternView>
+       <calls>
+        <Call order="1">
+         <ScheduledStopPointRef ref="{stop_a}"/>
+         <Arrival><Time>{t1}</Time><DayOffset>0</DayOffset></Arrival>
+         <Departure><Time>{t1}</Time><DayOffset>0</DayOffset></Departure>
+        </Call>
+        <Call order="2">
+         <ScheduledStopPointRef ref="{stop_b}"/>
+         <Arrival><Time>{t2}</Time><DayOffset>0</DayOffset></Arrival>
+         <Departure><Time>{t2}</Time><DayOffset>0</DayOffset></Departure>
+        </Call>
+       </calls>
+      </ServiceJourney>"""
+
+
+def _pt_netex(n_journeys: int = 2, n_calendars: int = None, conditions=(),
+              nested_calendar: bool = False, line: str = "193008",
+              n_identified: int = 0) -> str:
+    """Portuguese-profile feed. `n_calendars` defaults to one per journey; pass
+    a different number to break the pairing the importer relies on.
+
+    `n_identified` gives that many journeys an id of their own, so a feed can be
+    built that carries the profile's shape only as a minority.
+    """
+    count = n_journeys if n_calendars is None else n_calendars
+    keys = [f"2821{i:04d}" for i in range(count)]
+    calendars = "\n".join(
+        _pt_calendar_frame(k, conditions=conditions, nested=nested_calendar)
+        for k in keys
+    )
+    journeys = "\n".join(
+        _pt_journey(line, "1_801", "1_817", f"0{8 + i}:00:00", f"0{8 + i}:05:00")
+        .replace("<ServiceJourney>", f'<ServiceJourney id="own:{i}" version="any">',
+                 1 if i < n_identified else 0)
+        for i in range(n_journeys)
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<PublicationDelivery xmlns="http://www.netex.org.uk/netex" version="1.1">
+ <dataObjects>
+  <CompositeFrame id="transporlis:main" version="1.0">
+   <FrameDefaults><DefaultCodespaceRef ref="transporlis"/></FrameDefaults>
+   <frames>
+    <ResourceFrame id="transporlis:org" version="1.0">
+     <organisations><Authority id="1" version="any"><Name>Carris</Name></Authority></organisations>
+    </ResourceFrame>
+    <SiteFrame id="transporlis:sf" version="any">
+     <stopPlaces>
+      <StopPlace id="1_801" version="any"><Name>A</Name>
+       <Centroid><Location><Longitude>-9.13</Longitude><Latitude>38.76</Latitude></Location></Centroid>
+      </StopPlace>
+      <StopPlace id="1_817" version="any"><Name>B</Name>
+       <Centroid><Location><Longitude>-9.14</Longitude><Latitude>38.77</Latitude></Location></Centroid>
+      </StopPlace>
+     </stopPlaces>
+    </SiteFrame>
+    <ServiceFrame id="transporlis:svf" version="any">
+     <lines><Line id="193008" version="any"><Name>28E</Name><TransportMode>bus</TransportMode></Line></lines>
+     <routes><Route id="route:1" version="any"><LineRef ref="193008"/></Route></routes>
+     <scheduledStopPoints>
+      <ScheduledStopPoint id="1_801" version="any"><Name>A</Name></ScheduledStopPoint>
+      <ScheduledStopPoint id="1_817" version="any"><Name>B</Name></ScheduledStopPoint>
+     </scheduledStopPoints>
+    </ServiceFrame>
+{calendars}
+    <TimetableFrame id="transporlis:tf" version="any">
+     <vehicleJourneys>
+{journeys}
+     </vehicleJourneys>
+    </TimetableFrame>
+   </frames>
+  </CompositeFrame>
+ </dataObjects>
+</PublicationDelivery>
+"""
+
+
+class TestProfileDetection:
+    """The enum is picked from the shape of the document, never from a name."""
+
+    def test_portuguese_detected(self, db, tmp_path):
+        path = tmp_path / "carris.xml"
+        path.write_text(_pt_netex(), encoding="utf-8")
+        importer = NetexImporter()
+        importer.import_to_db(db, path)
+        assert importer.last_profile is NetexProfile.PORTUGUESE
+
+    def test_generic_for_our_own_export(self, db, tmp_path, minimal_gtfs_records):
+        zip_path = tmp_path / "feed.zip"
+        zip_path.write_bytes(make_gtfs_zip(minimal_gtfs_records))
+        GtfsImporter().import_to_db(db, zip_path)
+        out = tmp_path / "own.xml"
+        NetexExporter().export_from_db(db, out)
+        db2 = TransmodelDatabase(":memory:")
+        importer = NetexImporter()
+        importer.import_to_db(db2, out)
+        assert importer.last_profile is NetexProfile.GENERIC
+
+    def test_european_detected(self, db, tmp_path):
+        path = tmp_path / "fluo.xml"
+        path.write_text(FRENCH_PROFILE_NETEX, encoding="utf-8")
+        importer = NetexImporter()
+        importer.import_to_db(db, path)
+        assert importer.last_profile is NetexProfile.EUROPEAN
+
+    def test_explicit_profile_overrides_detection(self, db, tmp_path):
+        path = tmp_path / "carris.xml"
+        path.write_text(_pt_netex(), encoding="utf-8")
+        importer = NetexImporter(profile="generic")
+        stats = importer.import_to_db(db, path)
+        assert importer.last_profile is NetexProfile.GENERIC
+        # Forced away from the Portuguese branch, the id-less journeys are
+        # unusable again - and now they are counted, not dropped in silence.
+        assert stats.get("service_journey", 0) == 0
+
+    def test_coerce_accepts_name_value_and_member(self):
+        assert NetexProfile.coerce("portuguese") is NetexProfile.PORTUGUESE
+        assert NetexProfile.coerce("PORTUGUESE") is NetexProfile.PORTUGUESE
+        assert NetexProfile.coerce(NetexProfile.SWISS_SKI) is NetexProfile.SWISS_SKI
+        assert NetexProfile.coerce(None) is None
+        with pytest.raises(ValueError, match="Unknown NeTEx profile"):
+            NetexProfile.coerce("belgian")
+
+
+class TestPortugueseProfile:
+    """The Carris feed: journeys with no id, an inline pattern view, calls, and
+    one ServiceCalendarFrame per journey with no reference between the two."""
+
+    def _import(self, db, tmp_path, content):
+        path = tmp_path / "carris.xml"
+        path.write_text(content, encoding="utf-8")
+        return NetexImporter().import_to_db(db, path)
+
+    def test_journeys_without_id_are_imported(self, db, tmp_path):
+        stats = self._import(db, tmp_path, _pt_netex(n_journeys=3))
+        assert stats.get("service_journey", 0) == 3
+        assert stats.get("passing_time", 0) == 6
+
+    def test_ids_come_from_the_paired_calendar_key(self, db, tmp_path):
+        self._import(db, tmp_path, _pt_netex(n_journeys=2))
+        assert {j["id"] for j in db.get_records("service_journey")} == {
+            "sj:28210000", "sj:28210001"}
+
+    def test_calendar_pairs_by_document_order(self, db, tmp_path):
+        self._import(db, tmp_path, _pt_netex(n_journeys=2))
+        journeys = {j["id"]: j["day_type_id"] for j in db.get_records("service_journey")}
+        assert journeys["sj:28210000"] == "dt:28210000"
+        assert journeys["sj:28210001"] == "dt:28210001"
+
+    def test_day_type_dates_come_from_the_sibling_service_calendar(self, db, tmp_path):
+        self._import(db, tmp_path, _pt_netex(n_journeys=1))
+        dt = db.query("day_type", where={"id": "dt:28210000"})[0]
+        # The DayType itself has no ValidBetween; without the sibling lookup
+        # these would be the 1970/2099 defaults.
+        assert (dt["start_date"], dt["end_date"]) == ("20220117", "20220408")
+        assert dt["monday"] == 1 and dt["wednesday"] == 0
+
+    def test_departure_time_comes_from_the_first_call(self, db, tmp_path):
+        self._import(db, tmp_path, _pt_netex(n_journeys=2))
+        times = sorted(j["departure_time"] for j in db.get_records("service_journey"))
+        # Not midnight: the journey has no DepartureTime element of its own.
+        assert times == ["08:00:00", "09:00:00"]
+
+    def test_calls_become_ordered_passing_times(self, db, tmp_path):
+        self._import(db, tmp_path, _pt_netex(n_journeys=1))
+        pts = db.query("passing_time", where={"service_journey_id": "sj:28210000"},
+                       order_by="order")
+        assert [p["stop_point_id"] for p in pts] == ["1_801", "1_817"]
+        assert pts[0]["departure_time"] == "08:00:00"
+        assert pts[1]["arrival_time"] == "08:05:00"
+
+    def test_pairing_is_refused_when_the_counts_disagree(self, db, tmp_path, caplog):
+        # Three calendars for two journeys: the positional reading is no longer
+        # safe, so it must not be guessed at.
+        with caplog.at_level("WARNING"):
+            stats = self._import(db, tmp_path, _pt_netex(n_journeys=2, n_calendars=3))
+        assert "cannot pair them by position" in caplog.text
+        # Journeys are still lost rather than misdated - they have no id to fall
+        # back on - but the reason is now on the record.
+        assert stats.get("service_journey", 0) == 0
+        assert "no usable id" in caplog.text
+
+
+class TestPortugueseCalendarExceptions:
+    """AvailabilityConditions in this profile are calendar exceptions, not the
+    Swiss window-plus-bitmask. Read as the latter they become day types that are
+    never active on any weekday and change no service at all."""
+
+    def _import(self, db, tmp_path, content):
+        path = tmp_path / "carris.xml"
+        path.write_text(content, encoding="utf-8")
+        return NetexImporter().import_to_db(db, path)
+
+    def test_conditions_become_operating_day_exceptions(self, db, tmp_path):
+        stats = self._import(db, tmp_path, _pt_netex(
+            n_journeys=2, conditions=[("2022-03-01", True), ("2022-11-01", True)]))
+        assert stats.get("operating_day_exception", 0) == 4  # two per frame
+        rows = db.query("operating_day_exception", where={"day_type_id": "dt:28210000"})
+        assert sorted(r["date"] for r in rows) == ["20220301", "20221101"]
+
+    def test_conditions_do_not_become_day_types(self, db, tmp_path):
+        stats = self._import(db, tmp_path, _pt_netex(
+            n_journeys=2, conditions=[("2022-03-01", True)]))
+        # One day type per frame and nothing else: the conditions are exceptions
+        # now, not extra services that never run.
+        assert stats.get("day_type", 0) == 2
+        assert [d["id"] for d in db.get_records("day_type")] == [
+            "dt:28210000", "dt:28210001"]
+
+    def test_is_available_false_is_a_removal(self, db, tmp_path):
+        self._import(db, tmp_path, _pt_netex(
+            n_journeys=1, conditions=[("2022-03-01", True), ("2022-03-08", False)]))
+        rows = {r["date"]: r["is_addition"] for r
+                in db.get_records("operating_day_exception")}
+        assert rows == {"20220301": 1, "20220308": 0}
+
+    def test_exceptions_hang_off_the_paired_calendar(self, db, tmp_path):
+        # An exception has to reach the day type its own journey is paired with,
+        # or it changes the service of a journey that never ran that day.
+        self._import(db, tmp_path, _pt_netex(
+            n_journeys=2, conditions=[("2022-03-01", True)]))
+        journeys = {j["id"]: j["day_type_id"] for j in db.get_records("service_journey")}
+        exceptions = {e["day_type_id"] for e in db.get_records("operating_day_exception")}
+        assert exceptions == set(journeys.values())
+
+    def test_other_profiles_still_read_conditions_as_day_types(self, db, tmp_path):
+        # The Swiss reading is on the shared path and must be untouched by the
+        # Portuguese one: a window plus a bitmask still materialises a day type.
+        path = tmp_path / "swiss.xml"
+        path.write_text(AVAILABILITY_NETEX, encoding="utf-8")
+        stats = NetexImporter().import_to_db(db, path)
+        assert stats.get("day_type", 0) >= 1
+        assert stats.get("operating_day_exception", 0) >= 1
+
+
+class TestCalendarFrameGrouping:
+    """What shares a frame is grouped by containment, never by a shared id
+    suffix -- so the reading survives the other nesting order CEN allows."""
+
+    def _import(self, db, tmp_path, content):
+        path = tmp_path / "carris.xml"
+        path.write_text(content, encoding="utf-8")
+        return NetexImporter().import_to_db(db, path)
+
+    def test_dates_found_when_day_types_nest_inside_the_calendar(self, db, tmp_path):
+        # ServiceCalendar/dayTypes/DayType: the day type ends *before* the
+        # calendar does, the reverse of the Carris layout. Reading the frame as
+        # a whole is what makes both orders land on the same answer.
+        self._import(db, tmp_path, _pt_netex(n_journeys=1, nested_calendar=True))
+        dt = db.query("day_type", where={"id": "dt:28210000"})[0]
+        assert (dt["start_date"], dt["end_date"]) == ("20220117", "20220408")
+
+    def test_both_nestings_import_identically(self, db, tmp_path):
+        flat = self._import(db, tmp_path, _pt_netex(n_journeys=2))
+        db2 = TransmodelDatabase(":memory:")
+        path = tmp_path / "nested.xml"
+        path.write_text(_pt_netex(n_journeys=2, nested_calendar=True), encoding="utf-8")
+        assert NetexImporter().import_to_db(db2, path) == flat
+
+    def test_an_explicit_valid_between_is_never_overwritten(self, db, tmp_path):
+        # The frame window only fills a gap. A DayType that states its own dates
+        # has said something, and the calendar beside it does not get to
+        # contradict it.
+        content = _pt_netex(n_journeys=1).replace(
+            "<Name>28210000</Name>",
+            "<Name>28210000</Name><ValidBetween>"
+            "<FromDate>2023-05-01</FromDate><ToDate>2023-06-01</ToDate></ValidBetween>")
+        self._import(db, tmp_path, content)
+        dt = db.query("day_type", where={"id": "dt:28210000"})[0]
+        assert (dt["start_date"], dt["end_date"]) == ("20230501", "20230601")
+
+    def test_a_frame_of_thousands_is_not_collected(self):
+        # A national calendar is not a per-journey frame, and holding one to
+        # answer a question no profile asks of it is what the cap prevents.
+        frame = CalendarFrame()
+        for i in range(MAX_CONDITIONS_PER_FRAME + 1):
+            frame.add_condition(f"ac:{i}")
+        assert frame.overflowed and frame.condition_ids == []
+        frame.day_type_ids.append("dt:1")
+        assert not frame.is_per_journey()
+
+
+class TestNestedRouteRef:
+    """The RouteRef inside a JourneyPatternView, which the walk over a journey
+    direct children cannot see."""
+
+    def test_line_resolves_through_the_nested_route_ref(self, db, tmp_path):
+        # No LineRef anywhere on the journey: the only path to the line is
+        # JourneyPatternView/RouteRef -> Route -> Line. Without it the whole
+        # feed is dropped, exactly as journey-level indirection once was.
+        path = tmp_path / "carris.xml"
+        path.write_text(_pt_netex(n_journeys=2, line=None), encoding="utf-8")
+        stats = NetexImporter().import_to_db(db, path)
+        assert stats.get("service_journey", 0) == 2
+        assert {j["line_id"] for j in db.get_records("service_journey")} == {"193008"}
+
+    def test_a_broken_nested_ref_still_skips(self, db, tmp_path):
+        # The fallback must not fabricate a line when the reference resolves to
+        # nothing -- that is the guard that keeps the chain honest.
+        content = _pt_netex(n_journeys=2, line=None).replace(
+            '<Route id="route:1" version="any"><LineRef ref="193008"/></Route>', "")
+        path = tmp_path / "broken.xml"
+        path.write_text(content, encoding="utf-8")
+        stats = NetexImporter().import_to_db(db, path)
+        assert stats.get("service_journey", 0) == 0
+        assert stats.get(LOSS_JOURNEY_NO_LINE, 0) == 2
+
+
+class TestDetectionUsesRatios:
+    """A rule fires on the shape of most journeys, not on the first element that
+    matches: real feeds carry strays."""
+
+    def test_a_stray_id_less_journey_does_not_flip_the_profile(self, db, tmp_path):
+        # Three of four journeys name themselves. The one that does not must not
+        # decide how the other three are read.
+        path = tmp_path / "mixed.xml"
+        path.write_text(_pt_netex(n_journeys=4, n_identified=3), encoding="utf-8")
+        importer = NetexImporter()
+        importer.import_to_db(db, path)
+        assert importer.last_profile is not NetexProfile.PORTUGUESE
+
+    def test_the_majority_shape_still_wins(self, db, tmp_path):
+        path = tmp_path / "mostly.xml"
+        path.write_text(_pt_netex(n_journeys=4, n_identified=1), encoding="utf-8")
+        importer = NetexImporter()
+        importer.import_to_db(db, path)
+        assert importer.last_profile is NetexProfile.PORTUGUESE
+
+    def test_no_journeys_is_generic(self):
+        assert ProfileEvidence().detect() is NetexProfile.GENERIC
+
+
+class TestProfileAdapterContract:
+    """Every hook answers "nothing to do" unless a subclass says otherwise --
+    which is what stops a new dialect changing how the others are read."""
+
+    def test_base_adapter_is_inert(self):
+        adapter = ProfileAdapter()
+        resolution = adapter.resolve_calendar([CalendarFrame()], {}, {}, 3)
+        assert resolution.exceptions == []
+        assert resolution.claimed_conditions == set()
+        assert resolution.journey_day_types is None
+        assert adapter.synthesize_journey_id("dt:1", 0) is None
+        assert adapter.nested_route_ref(None, {}) is None
+
+    def test_every_profile_has_an_adapter(self):
+        for profile in NetexProfile:
+            assert make_adapter(profile).profile is profile
+
+    def test_profiles_with_no_special_reading_inherit_the_inert_hooks(self):
+        for profile in (NetexProfile.SWISS_SKI, NetexProfile.EUROPEAN):
+            adapter = make_adapter(profile)
+            assert adapter.resolve_calendar([], {}, {}, 0).journey_day_types is None
+            assert adapter.synthesize_journey_id("dt:1", 0) is None
+
+
+class TestImportLossIsReturned:
+    """What the file held and the database does not is part of the result, not a
+    line of log the caller has no way to reach."""
+
+    def test_a_clean_feed_reports_no_loss(self, db, tmp_path):
+        path = tmp_path / "carris.xml"
+        path.write_text(_pt_netex(n_journeys=2), encoding="utf-8")
+        stats = NetexImporter().import_to_db(db, path)
+        assert not [k for k in stats if k.startswith(LOSS_PREFIXES)]
+
+    def test_journeys_with_no_usable_id_are_counted(self, db, tmp_path):
+        # The pairing is refused, so these journeys have nothing to be keyed on.
+        path = tmp_path / "carris.xml"
+        path.write_text(_pt_netex(n_journeys=2, n_calendars=3), encoding="utf-8")
+        stats = NetexImporter().import_to_db(db, path)
+        assert stats[LOSS_JOURNEY_NO_ID] == 2
+        assert stats.get("service_journey", 0) == 0
+
+    def test_loss_keys_cannot_be_mistaken_for_table_counts(self, db, tmp_path):
+        from pid_transit.core.database import TRANSMODEL_ENTITIES
+
+        path = tmp_path / "carris.xml"
+        path.write_text(_pt_netex(n_journeys=2, n_calendars=3), encoding="utf-8")
+        stats = NetexImporter().import_to_db(db, path)
+        losses = {k for k in stats if k.startswith(LOSS_PREFIXES)}
+        assert losses
+        assert not losses & set(TRANSMODEL_ENTITIES)

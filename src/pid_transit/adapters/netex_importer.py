@@ -18,9 +18,30 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 from pathlib import Path
 
 from ..core.database import TransmodelDatabase
+from .netex_profiles import (
+    DEFAULT_END_DATE,
+    DEFAULT_START_DATE,
+    CalendarFrame,
+    NetexProfile,
+    ProfileAdapter,
+    ProfileEvidence,
+    make_adapter,
+)
 from ..core.exceptions import ImportCancelledError
 
 logger = logging.getLogger(__name__)
+
+# Stat keys for what the file held and the database does not. They travel in the
+# same dict as the table counts because losing service is part of the result of
+# an import, not a footnote to it -- a caller asking "what could you not read?"
+# gets a number instead of a promise. The prefixes keep them tellable apart from
+# table names for anything that renders the dict.
+LOSS_PREFIXES = ("skipped_", "dropped_")
+LOSS_JOURNEY_NO_LINE = "skipped_service_journey_unresolved_line"
+LOSS_JOURNEY_NO_ID = "skipped_service_journey_no_id"
+LOSS_PASSING_TIME_NO_STOP = "dropped_passing_time_unknown_stop"
+LOSS_TRANSFER_NO_STOP = "dropped_transfer_unknown_stop"
+LOSS_PATTERN_POINT_NO_STOP = "dropped_point_in_journey_pattern_unknown_stop"
 
 _DEFAULT_NS = {"n": "http://www.netex.org.uk/netex"}
 _GML_NS = "http://www.opengis.net/gml/3.2"
@@ -231,10 +252,51 @@ class _RunState:
         # skips the rest (site/resource/calendar files) instead of re-parsing
         self.current_file: Optional[str] = None
         self.files_with_journeys: set = set()
+        # Which dialect this source turned out to be. Filled in after pass 1
+        # from `evidence`; the flush and pass 2 go through `adapter`, which is
+        # the only thing either of them asks about the profile.
+        self.evidence: ProfileEvidence = ProfileEvidence()
+        self.profile: NetexProfile = NetexProfile.GENERIC
+        self.adapter: ProfileAdapter = ProfileAdapter()
+        # ServiceCalendarFrames, grouped by containment as pass 1 walks them.
+        # Neutral: which profile (if any) makes anything of the grouping is
+        # decided afterwards, by the adapter -- pass 1 only records the shape.
+        self.calendar_frames: List[CalendarFrame] = []
+        self.open_frame: Optional[CalendarFrame] = None
+        # Day types to pair with journeys by document position, when the
+        # adapter says this profile pairs them that way at all.
+        self.journey_day_types: Optional[List[str]] = None
 
     def add_stat(self, key: str, n: int) -> None:
         if n:
             self.stats[key] = self.stats.get(key, 0) + n
+
+    def frame(self) -> CalendarFrame:
+        """The ServiceCalendarFrame currently being walked.
+
+        Opened lazily by the first child that reports into it, because
+        `_stream` dispatches end events only: there is no start-of-frame to
+        hook, and the frame's own end arrives after all of its children.
+        """
+        if self.open_frame is None:
+            self.open_frame = CalendarFrame()
+        return self.open_frame
+
+    def commit_frame(self) -> None:
+        """Close the open frame and keep it. Called when a frame element ends."""
+        if self.open_frame is not None:
+            self.calendar_frames.append(self.open_frame)
+            self.open_frame = None
+
+    def discard_frame(self) -> None:
+        """Drop anything collected outside a frame that ever closed.
+
+        A file may carry day types and conditions that no ServiceCalendarFrame
+        contains. Those never formed a frame, so keeping them as one would
+        invent a grouping the document does not make -- and would let it grow
+        for the length of the file.
+        """
+        self.open_frame = None
 
 
 class NetexImporter:
@@ -242,10 +304,15 @@ class NetexImporter:
     Adapter class for importing NeTEx XML files into the Transmodel database.
     """
 
-    def __init__(self, fallback_timezone: str = "UTC", on_progress=None, cancel_event=None):
+    def __init__(self, fallback_timezone: str = "UTC", on_progress=None, cancel_event=None,
+                 profile: "NetexProfile | str | None" = None):
         """
         Args:
             fallback_timezone: timezone assigned to operators (NeTEx has none).
+            profile: force a `NetexProfile` instead of detecting one. Detection
+                is structural and reliable on the feeds we have, but a caller
+                who knows what they were sent should be able to say so -- and a
+                wrong auto-detection needs an escape hatch that is not a patch.
             on_progress: optional callable
                 ``(entity_type: str, count: int, *, file_index=None, total_files=None)``
                 fired after every batch flush with the cumulative row count for
@@ -257,6 +324,11 @@ class NetexImporter:
         self.fallback_timezone = fallback_timezone
         self.on_progress = on_progress
         self.cancel_event = cancel_event
+        self.profile = NetexProfile.coerce(profile)
+        # The profile the last import actually ran under: the detected one, or
+        # `profile` when it was forced. Readable afterwards so a caller can say
+        # what it was handed, and report it.
+        self.last_profile: Optional[NetexProfile] = None
         self._ns: Dict[str, str] = dict(_DEFAULT_NS)
         self._file_index: Optional[int] = None
         self._total_files: Optional[int] = None
@@ -301,7 +373,18 @@ class NetexImporter:
                 logger.info("NeTEx pass 1 (reference data, file %d/%d): %s", i, n, label)
                 with opener() as f:
                     self._stream(f, pass1_handlers, label)
+                # Whatever is still open never saw its frame close, so it never
+                # was one -- and must not straddle two files.
+                state.discard_frame()
             self._check_cancel()
+            state.profile = self.profile or state.evidence.detect()
+            state.adapter = make_adapter(state.profile)
+            self.last_profile = state.profile
+            logger.info(
+                "NeTEx profile: %s (%s)%s",
+                state.profile.value, state.evidence.summary(),
+                " [forced]" if self.profile else "",
+            )
             self._flush_reference_data(db, state)
             pass2 = _Pass2(self, db, state)
             pass2_handlers = pass2.handlers()
@@ -316,16 +399,23 @@ class NetexImporter:
                 with opener() as f:
                     self._stream(f, pass2_handlers, label)
             pass2.flush()
-            if pass2.skipped_journeys:
-                logger.warning(
-                    "Skipped %d service journeys with unresolvable line references",
-                    pass2.skipped_journeys,
-                )
-            if pass2.dropped_call_stops:
-                logger.warning(
-                    "Dropped %d call passing times referencing unknown stops",
-                    pass2.dropped_call_stops,
-                )
+            # What the import could not read is part of its result, not a line
+            # of log a caller has no way to reach. Every key here is a count of
+            # something the file contained and the database does not, so
+            # "imported 10 238 journeys" can be read next to "and lost none".
+            # Zero-valued losses add no key, so a clean feed's stats are exactly
+            # the table counts they have always been.
+            for key, count, message in (
+                (LOSS_JOURNEY_NO_LINE, pass2.skipped_journeys,
+                 "Skipped %d service journeys with unresolvable line references"),
+                (LOSS_JOURNEY_NO_ID, pass2.journeys_without_id,
+                 "Skipped %d service journeys with no usable id"),
+                (LOSS_PASSING_TIME_NO_STOP, pass2.dropped_call_stops,
+                 "Dropped %d call passing times referencing unknown stops"),
+            ):
+                if count:
+                    state.add_stat(key, count)
+                    logger.warning(message, count)
         return state.stats
 
     # -------------------------------------------------------------------------
@@ -508,13 +598,35 @@ class NetexImporter:
             if valid_between is not None:
                 start = _date_from_iso(_text(valid_between.find("n:FromDate", self._ns)))
                 end = _date_from_iso(_text(valid_between.find("n:ToDate", self._ns)))
+            # Which frame it arrived in is recorded; what that grouping means
+            # is the adapter's business, after the profile is known.
+            state.frame().day_type_ids.append(dtid)
             state.day_type_ids.add(dtid)
             state.day_types[dtid] = {
                 "id": dtid,
                 **flags,
-                "start_date": start or "19700101",
-                "end_date": end or "20991231",
+                "start_date": start or DEFAULT_START_DATE,
+                "end_date": end or DEFAULT_END_DATE,
             }
+
+        def on_service_calendar(sc: ET.Element) -> None:
+            # A ServiceCalendar bounds the day types in its frame. Some profiles
+            # state their dates nowhere else -- the Portuguese DayType carries
+            # weekday flags but no ValidBetween -- but reading it is the
+            # adapter's decision, not this handler's.
+            state.frame().window = (
+                _date_from_iso(_text(sc.find("n:FromDate", self._ns))),
+                _date_from_iso(_text(sc.find("n:ToDate", self._ns))),
+            )
+
+        def on_service_calendar_frame(scf: ET.Element) -> None:
+            # The frame's end is what closes the grouping: every child that
+            # reported into it has already ended, whichever order the producer
+            # nested them in. Handling it also lets `_stream` prune the husk --
+            # the Portuguese profile emits one frame per journey, so leaving
+            # 10k+ of them in the tree costs memory for nothing.
+            state.evidence.service_calendar_frames += 1
+            state.commit_frame()
 
         def on_day_type_assignment(a: ET.Element) -> None:
             dt_ref = a.find("n:DayTypeRef", self._ns)
@@ -542,15 +654,21 @@ class NetexImporter:
             )
 
         def on_availability_condition(c: ET.Element) -> None:
-            # Swiss-profile calendars: a validity window plus a day bitmask,
-            # referenced from ServiceJourney validityConditions.
+            # Two profiles spell very different things with this element: a
+            # validity window plus a day bitmask (Swiss), or a single-date
+            # exception carrying IsAvailable (Portuguese). Both readings need
+            # the same four fields, so all four are collected and the adapter
+            # decides which one the file is making.
+            state.evidence.availability_conditions += 1
             cid = c.attrib.get("id")
             if not cid:
                 return
+            state.frame().add_condition(cid)
             state.avail_conditions[cid] = (
                 _date_from_iso(_text(c.find("n:FromDate", self._ns))),
                 _date_from_iso(_text(c.find("n:ToDate", self._ns))),
                 _text(c.find("n:ValidDayBits", self._ns)),
+                _text(c.find("n:IsAvailable", self._ns)) != "false",
             )
 
         def on_connection(conn: ET.Element) -> None:
@@ -600,6 +718,7 @@ class NetexImporter:
                 logger.warning("Invalid gml:posList on ServiceLink %s", link_id)
 
         def on_pattern(jp: ET.Element) -> None:
+            state.evidence.journey_patterns += 1
             jpid = jp.attrib.get("id")
             if not jpid:
                 return
@@ -663,13 +782,26 @@ class NetexImporter:
         def on_service_journey(sj: ET.Element) -> None:
             # Light scan only: patterns without their own route/line reference
             # are resolved through the journeys that use them. Also marks the
-            # file as journey-bearing so pass 2 knows to re-parse it.
+            # file as journey-bearing so pass 2 knows to re-parse it, and counts
+            # the structural evidence that picks the profile.
             state.files_with_journeys.add(state.current_file)
+            ev = state.evidence
+            ev.journeys += 1
+            if not sj.attrib.get("id"):
+                ev.journeys_without_id += 1
             uri = self._ns["n"]
             q_jp = f"{{{uri}}}JourneyPatternRef"
             q_sjp = f"{{{uri}}}ServiceJourneyPatternRef"
             q_lr = f"{{{uri}}}LineRef"
+            q_jpv = f"{{{uri}}}JourneyPatternView"
+            q_calls = f"{{{uri}}}calls"
             jp = sjp = lr = None
+            for child in sj:
+                tag = child.tag
+                if tag == q_jpv:
+                    ev.journeys_with_pattern_view += 1
+                elif tag == q_calls:
+                    ev.journeys_with_calls += 1
             for child in sj:
                 tag = child.tag
                 if tag == q_jp:
@@ -686,6 +818,10 @@ class NetexImporter:
                 if jp is not None and lr is not None:
                     break
             jp = jp or sjp
+            if lr:
+                ev.journeys_with_line_ref += 1
+            if jp:
+                ev.journeys_with_pattern_ref += 1
             if jp and lr and jp not in state.jp_to_line:
                 state.jp_to_line[jp] = lr
 
@@ -698,6 +834,8 @@ class NetexImporter:
             "Line": on_line,
             "Route": on_route,
             "DayType": on_day_type,
+            "ServiceCalendar": on_service_calendar,
+            "ServiceCalendarFrame": on_service_calendar_frame,
             "DayTypeAssignment": on_day_type_assignment,
             "OperatingPeriod": on_operating_period,
             "UicOperatingPeriod": on_operating_period,
@@ -754,8 +892,21 @@ class NetexImporter:
                         row["end_date"] = p_to
         state.day_type_assignments = []
 
-        for cid, (c_from, c_to, bits) in state.avail_conditions.items():
-            if cid in state.day_types:
+        # What the profile makes of the calendar frames pass 1 grouped. The
+        # base adapter makes nothing of them, so every other profile reaches
+        # the shared reading below exactly as it did before this seam existed.
+        resolution = state.adapter.resolve_calendar(
+            state.calendar_frames, state.day_types, state.avail_conditions,
+            state.evidence.journeys,
+        )
+        exceptions.extend(resolution.exceptions)
+        state.journey_day_types = resolution.journey_day_types
+        for note in resolution.notes:
+            logger.warning("%s profile: %s", state.profile.value, note)
+        state.calendar_frames = []
+
+        for cid, (c_from, c_to, bits, _available) in state.avail_conditions.items():
+            if cid in state.day_types or cid in resolution.claimed_conditions:
                 continue
             state.day_types[cid] = {
                 "id": cid,
@@ -797,6 +948,7 @@ class NetexImporter:
             ]
             dropped = len(state.transfers) - len(transfer_rows)
             if dropped:
+                state.add_stat(LOSS_TRANSFER_NO_STOP, dropped)
                 logger.warning("Dropped %d transfers referencing unknown stops", dropped)
             for i in range(0, len(transfer_rows), BATCH_SIZE):
                 self._check_cancel()
@@ -923,6 +1075,7 @@ class NetexImporter:
             state.jp_to_line[jpid] = line_id
             for order, _spi_id, ssp_ref in spi_points:
                 if ssp_ref not in state.stop_ids:
+                    state.add_stat(LOSS_PATTERN_POINT_NO_STOP, 1)
                     logger.warning(
                         "JourneyPattern %s references unknown stop %s, dropping point",
                         jpid, ssp_ref,
@@ -1000,6 +1153,15 @@ class _Pass2:
         self.missing_day_types: set = set()
         self.skipped_journeys = 0
         self.dropped_call_stops = 0
+        self.journeys_without_id = 0
+        self.adapter = state.adapter
+        # Day types to pair with journeys by document position, for the profiles
+        # whose journeys carry neither an id nor a calendar reference. `None`
+        # means this profile does not pair that way, which is every profile the
+        # adapter has not said otherwise about; the guard that decides it lives
+        # in the adapter, because the assumption is the profile's, not ours.
+        self.journey_pairing: Optional[List[str]] = state.journey_day_types
+        self.journey_ordinal = 0
         # namespace-qualified tag cache; rebuilt when a file changes namespace
         self._q_uri: Optional[str] = None
         self._qt: Dict[str, str] = {}
@@ -1012,7 +1174,7 @@ class _Pass2:
         "MobilityImpairedAccess", "TimetabledPassingTime",
         "StopPointInJourneyPatternRef", "ArrivalTime", "ArrivalDayOffset",
         "Call", "ScheduledStopPointRef", "Arrival", "Departure", "Time",
-        "DayOffset",
+        "DayOffset", "JourneyPatternView",
     )
 
     def handlers(self) -> Dict[str, callable]:
@@ -1027,6 +1189,31 @@ class _Pass2:
             self._qt = {t: f"{{{uri}}}{t}" for t in self._TAGS}
             self._q_uri = uri
         return self._qt
+
+    @staticmethod
+    def _first_call_departure(calls_el: ET.Element, Q: Dict[str, str]):
+        """(Time, DayOffset) of the first Call that has a Departure, or None.
+
+        The journey's own departure time, for profiles that only state it once,
+        inside the stop sequence.
+        """
+        q_call, q_dep = Q["Call"], Q["Departure"]
+        q_time, q_off = Q["Time"], Q["DayOffset"]
+        for call in calls_el:
+            if call.tag != q_call:
+                continue
+            for c in call:
+                if c.tag != q_dep:
+                    continue
+                t = off = None
+                for d in c:
+                    if d.tag == q_time:
+                        t = _text(d)
+                    elif d.tag == q_off:
+                        off = _text(d)
+                if t:
+                    return t, off
+        return None
 
     @staticmethod
     def _call_time(el: Optional[ET.Element], q_time: str, q_off: str) -> Optional[str]:
@@ -1047,7 +1234,20 @@ class _Pass2:
     def on_service_journey(self, sj: ET.Element) -> None:
         ns = self.importer._ns
         sjid = sj.attrib.get("id")
+        # One slot per journey in document order, consumed whether or not this
+        # journey needed it -- skipping a slot would shift every later journey
+        # onto the wrong calendar.
+        ordinal = self.journey_ordinal
+        self.journey_ordinal += 1
+        paired_day_type = None
+        if self.journey_pairing is not None and ordinal < len(self.journey_pairing):
+            paired_day_type = self.journey_pairing[ordinal]
         if not sjid:
+            sjid = self.adapter.synthesize_journey_id(paired_day_type, ordinal)
+        if not sjid:
+            # Unusable: nothing to key the journey on. Counted rather than
+            # dropped in silence, so an import that loses service says so.
+            self.journeys_without_id += 1
             return
         # One walk over the journey's direct children replaces the dozen
         # find() path evaluations that used to dominate pass-2 CPU.
@@ -1107,6 +1307,14 @@ class _Pass2:
                             wheelchair = {"true": 1, "false": 2}.get(_text(r))
                             break
 
+        if dep_time_text is None and calls_el is not None:
+            # Profiles that carry stop times as calls (Swiss, Portuguese) have
+            # no DepartureTime on the journey; without this every journey would
+            # be recorded as departing at midnight.
+            first = self._first_call_departure(calls_el, Q)
+            if first is not None:
+                dep_time_text, dep_offset_text = first
+
         departure_time = _reconstruct_time(
             dep_time_text or "00:00:00",
             int(dep_offset_text) if dep_offset_text else 0)
@@ -1122,6 +1330,17 @@ class _Pass2:
                 line_id = self.state.jp_to_line.get(jp_id)
             if not line_id and route_ref_id:
                 line_id = self.state.route_to_line.get(route_ref_id)
+            if not line_id:
+                # Last resort: a reference the walk over direct children cannot
+                # reach, because this profile nests it. Asked only here, so a
+                # feed that names its line never pays for it.
+                nested = self.adapter.nested_route_ref(sj, Q)
+                if nested:
+                    line_id = (self.state.route_to_line.get(nested)
+                               or self.state.jp_to_line.get(nested))
+
+        if day_type_id is None and avail_ref_id is None and paired_day_type is not None:
+            day_type_id = paired_day_type
 
         if day_type_id is None and avail_ref_id is None:
             # Rare path: a DayTypeRef somewhere other than dayTypes/. Only
