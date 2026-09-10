@@ -242,7 +242,8 @@ class TestSchemaOrder:
         frame = next(root.iter(f"{{{NS['n']}}}ServiceFrame"))
         tags = [el.tag.rpartition("}")[2] for el in frame]
         assert tags == sorted(tags, key=[
-            "Name", "lines", "scheduledStopPoints", "serviceLinks", "connections",
+            "ValidBetween", "TypeOfFrameRef", "Name", "lines",
+            "scheduledStopPoints", "serviceLinks", "connections",
             "stopAssignments", "journeyPatterns",
         ].index)
 
@@ -266,3 +267,170 @@ class TestSchemaOrder:
         journey = next(root.iter(f"{{{NS['n']}}}TemplateServiceJourney"))
         tags = [el.tag.rpartition("}")[2] for el in journey]
         assert tags.index("passingTimes") < tags.index("frequencyGroups")
+
+
+class TestPassingTimeAnchoring:
+    """A TimetabledPassingTime names no stop of its own.
+
+    It says only "the k-th point of this journey's pattern", so the writer's
+    positional match is the only thing binding a time to a place. When the two
+    sequences disagree, writing the ref anyway produced a schema-valid document
+    stating a timetable the feed does not contain — and returned ``{}``.
+    """
+
+    PATTERN = [{"id": "JPA", "line_id": "L1", "direction": "outbound"}]
+
+    def _db(self, journey_stops):
+        points = [{"journey_pattern_id": "JPA", "stop_point_id": f"S{i}",
+                   "order": i} for i in range(3)]
+        journeys = [{"id": "TA", "line_id": "L1", "journey_pattern_id": "JPA",
+                     "day_type_id": "WEEKDAY", "departure_time": "08:00:00"}]
+        db = _seeded_db(FIVE_STOPS[:3], self.PATTERN, points, journeys, [])
+        db.upsert("passing_time", [
+            {"service_journey_id": "TA", "stop_point_id": stop, "order": i,
+             "arrival_time": f"08:0{i}:00", "departure_time": f"08:0{i}:00"}
+            for i, stop in enumerate(journey_stops)
+        ])
+        return db
+
+    @staticmethod
+    def _export(db, tmp_path, dedup=False):
+        out = tmp_path / "feed.xml"
+        losses = NetexExporter(deduplicate_patterns=dedup).export_from_db(db, out)
+        return ET.parse(out).getroot(), losses
+
+    def _refs(self, root):
+        return [el.get("ref") for el
+                in root.iter(f"{{{NS['n']}}}StopPointInJourneyPatternRef")]
+
+    def test_a_journey_that_follows_its_pattern_is_untouched(self, tmp_path):
+        root, losses = self._export(self._db(["S0", "S1", "S2"]), tmp_path)
+        assert self._refs(root) == ["JPA_stop_0", "JPA_stop_1", "JPA_stop_2"]
+        assert losses == {}
+
+    @pytest.mark.parametrize("dedup", [False, True])
+    def test_a_time_at_the_wrong_stop_is_dropped_and_counted(self, tmp_path, dedup):
+        # The journey runs the pattern backwards: only the middle position
+        # names the same stop in both sequences.
+        root, losses = self._export(self._db(["S2", "S1", "S0"]), tmp_path, dedup)
+        assert self._refs(root) == ["JPA_stop_1"]
+        assert losses["dropped_passing_time_stop_mismatch"] == 2
+
+    def test_the_count_is_not_confused_with_an_overlong_journey(self, tmp_path):
+        # Pattern S0,S1,S2 against a journey S0,S2,S2,S1: position 1 names the
+        # wrong stop, position 3 is past the end of the pattern. Two different
+        # questions -- fix the feed, or choose another pattern -- so two keys.
+        root, losses = self._export(self._db(["S0", "S2", "S2", "S1"]), tmp_path)
+        assert self._refs(root) == ["JPA_stop_0", "JPA_stop_2"]
+        assert losses["dropped_passing_time_stop_mismatch"] == 1
+        assert losses["dropped_passing_time_no_pattern_point"] == 1
+
+
+class TestLossesAreOneDocument:
+    def test_a_reused_exporter_does_not_add_up_its_runs(self, tmp_path):
+        points = [{"journey_pattern_id": "JPA", "stop_point_id": f"S{i}",
+                   "order": i} for i in range(2)]
+        journeys = [{"id": "TA", "line_id": "L1", "journey_pattern_id": "JPA",
+                     "day_type_id": "WEEKDAY", "departure_time": "08:00:00"}]
+        db = _seeded_db(FIVE_STOPS[:2],
+                        [{"id": "JPA", "line_id": "L1", "direction": "outbound"}],
+                        points, journeys, [])
+        exporter = NetexExporter(profile="pt", deduplicate_patterns=False)
+        first = exporter.export_from_db(db, tmp_path / "one.xml")
+        second = exporter.export_from_db(db, tmp_path / "two.xml")
+        assert first, "the PT profile has losses to report on this feed"
+        assert second == first
+
+
+class TestStopTypeFollowsTheMode:
+    """A StopPlace is typed by the lines that call there, not assumed to be a bus.
+
+    `StopPlaceType` was the constant "onstreetBus", so a metro network shipped
+    a document whose Line said `metro` and whose every StopPlace said on-street
+    bus stop. That is the false statement `vehicle_mode` already refuses to
+    make, on the entity next door.
+    """
+
+    MODES = [("metro", "metroStation"), ("tram", "onstreetTram"),
+             ("rail", "railStation"), ("ferry", "ferryStop"),
+             ("funicular", "liftStation"), ("bus", "onstreetBus"),
+             ("monorail", "other")]
+
+    def _db(self, mode):
+        db = _seeded_db(FIVE_STOPS[:2],
+                        [{"id": "JPA", "line_id": "L1", "direction": "outbound"}],
+                        [{"journey_pattern_id": "JPA", "stop_point_id": f"S{i}",
+                          "order": i} for i in range(2)],
+                        [{"id": "TA", "line_id": "L1", "journey_pattern_id": "JPA",
+                          "day_type_id": "WEEKDAY", "departure_time": "08:00:00"}],
+                        [])
+        db.upsert("line", [{"id": "L1", "operator_id": "OP1", "name": "Line One",
+                            "transport_mode": mode}])
+        return db
+
+    @pytest.mark.parametrize("mode,stop_type", MODES)
+    def test_the_stop_type_is_the_mode_that_serves_it(self, tmp_path, mode, stop_type):
+        root = _export_root(self._db(mode), tmp_path)
+        types = {el.text for el in root.iter(f"{{{NS['n']}}}StopPlaceType")}
+        assert types == {stop_type}
+
+    def test_a_stop_no_line_calls_at_takes_the_feed_s_own_mode(self, tmp_path):
+        db = self._db("metro")
+        db.upsert("scheduled_stop_point", [{"id": "S9", "name": "Orphan",
+                                            "lat": 40.9, "lon": -74.9}])
+        root = _export_root(db, tmp_path)
+        types = {el.text for el in root.iter(f"{{{NS['n']}}}StopPlaceType")}
+        assert types == {"metroStation"}, "one-mode feed has an honest answer"
+
+    def test_an_untypable_stop_is_counted_once_not_once_per_element(self, tmp_path):
+        # The PT profile locates its stop points, so it states the type twice
+        # per stop -- StopPlaceType and StopType. One stop it cannot type is
+        # one loss.
+        out = tmp_path / "pt.xml"
+        losses = NetexExporter(profile="pt", deduplicate_patterns=False
+                               ).export_from_db(self._db("metro"), out)
+        assert losses["unsupported_stop_place_type"] == 2, "two stops, two losses"
+
+
+class TestDegenerateJourneyPattern:
+    """CEN sequences two points in a JourneyPattern or none (minOccurs="2")."""
+
+    def _db(self):
+        db = _seeded_db(FIVE_STOPS[:1],
+                        [{"id": "JPA", "line_id": "L1", "direction": "outbound"}],
+                        [{"journey_pattern_id": "JPA", "stop_point_id": "S0",
+                          "order": 0}],
+                        [{"id": "TA", "line_id": "L1", "journey_pattern_id": "JPA",
+                          "day_type_id": "WEEKDAY", "departure_time": "08:00:00"}],
+                        [])
+        db.upsert("passing_time", [{"service_journey_id": "TA",
+                                    "stop_point_id": "S0", "order": 0,
+                                    "departure_time": "08:00:00"}])
+        return db
+
+    def test_a_one_point_pattern_sequences_nothing_and_says_so(self, tmp_path):
+        out = tmp_path / "feed.xml"
+        losses = NetexExporter(deduplicate_patterns=False).export_from_db(
+            self._db(), out)
+        root = ET.parse(out).getroot()
+        assert not list(root.iter(f"{{{NS['n']}}}pointsInSequence")), (
+            "a single StopPointInJourneyPattern makes the document invalid"
+        )
+        assert losses["dropped_point_in_journey_pattern_single"] == 1
+
+    def test_its_journey_references_no_point_that_was_not_written(self, tmp_path):
+        out = tmp_path / "feed.xml"
+        losses = NetexExporter(deduplicate_patterns=False).export_from_db(
+            self._db(), out)
+        root = ET.parse(out).getroot()
+        assert not list(root.iter(f"{{{NS['n']}}}StopPointInJourneyPatternRef"))
+        assert losses["dropped_passing_time_no_pattern_point"] == 1
+
+    def test_a_one_call_journey_is_left_out_of_the_pt_document(self, tmp_path):
+        # Same CEN rule on the calls form: `calls` sequences two Calls or none.
+        out = tmp_path / "pt.xml"
+        losses = NetexExporter(profile="pt", deduplicate_patterns=False
+                               ).export_from_db(self._db(), out)
+        root = ET.parse(out).getroot()
+        assert not list(root.iter(f"{{{NS['n']}}}calls"))
+        assert losses["dropped_call_single_journey"] == 1

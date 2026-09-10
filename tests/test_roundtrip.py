@@ -320,6 +320,105 @@ class TestNetexRoundTrip:
             assert first.db.count(table) == second.db.count(table), table
 
 
+class TestNetexSaysWhatTheModelHolds:
+    """The acceptance criterion of NETEX_EXPORT_AUDITORIA.md, as a test.
+
+    The audit's finding was not that the exporter wrote a bad file -- the file
+    passed the CEN XSD with zero errors, had no dangling reference and lost no
+    timetable. It was that six fields left the document without appearing in any
+    count, and that the worst of them, the timezone, silently moved all 461 359
+    passing times of the STCP feed by an hour.
+
+    So the criterion has two halves and both are here: a field the writer places
+    comes back through a round trip that is given *no* fallback to lean on, and
+    a field it cannot place is a number in the return value. A test that checked
+    only the first half would let the next silent drop through.
+    """
+
+    @pytest.fixture
+    def roundtripped(self, rich_gtfs_records, tmp_path):
+        from pid_transit.adapters.netex_importer import NetexImporter
+        from pid_transit.adapters.netex_exporter import NetexExporter
+
+        # Not UTC. With UTC the assertion below would pass just as well against
+        # an exporter that wrote no timezone at all, because UTC is exactly what
+        # the importer falls back to -- which is how the defect survived.
+        rich_gtfs_records["agency"][0]["agency_timezone"] = "Europe/Lisbon"
+        zip_path = tmp_path / "rich.zip"
+        zip_path.write_bytes(make_gtfs_zip(rich_gtfs_records))
+        source = _import_gtfs(zip_path)
+
+        netex = tmp_path / "feed.xml"
+        losses = source.export_data(
+            NetexExporter(deduplicate_patterns=False), netex)
+        back = TransitDataset(":memory:")
+        # Deliberately no fallback_timezone: the document has to carry it.
+        back.import_data(NetexImporter(), netex)
+        return source, back, losses
+
+    def test_the_timezone_survives_without_being_told_it(self, roundtripped):
+        _, back, _ = roundtripped
+        assert back.db.get_records("operator")[0]["timezone"] == "Europe/Lisbon"
+
+    def test_the_operator_keeps_its_url_and_language(self, roundtripped):
+        _, back, _ = roundtripped
+        operator = back.db.get_records("operator")[0]
+        assert operator["url"] == "https://example.com"
+        assert operator["lang"] == "en"
+
+    def test_the_line_keeps_its_colours_url_and_description(self, roundtripped):
+        _, back, _ = roundtripped
+        line = back.db.get_one("line", {"id": "R1"})
+        assert line["color"] == "FF0000"
+        assert line["text_color"] == "FFFFFF"
+        assert line["url"] == "https://example.com/r1"
+        assert line["description"] == "Main line"
+
+    def test_the_stop_keeps_its_rider_facing_code(self, roundtripped):
+        _, back, _ = roundtripped
+        assert back.db.get_one("scheduled_stop_point", {"id": "S1"})["code"] == "1001"
+
+    def test_the_feed_keeps_its_provenance(self, roundtripped):
+        # The whole feed_info table used to disappear, and with it the publisher,
+        # the validity window and the version -- who made the file and for when.
+        _, back, _ = roundtripped
+        info = back.db.get_records("feed_info")
+        assert len(info) == 1
+        assert info[0]["publisher_name"] == "Test Publisher"
+        assert info[0]["publisher_url"] == "https://example.com"
+        assert info[0]["lang"] == "en"
+        assert (info[0]["start_date"], info[0]["end_date"]) == ("20260101", "20261231")
+        assert info[0]["version"] == "1.0"
+
+    def test_every_field_that_did_not_survive_is_counted(self, roundtripped):
+        # The half that keeps the other half honest. Whatever the writer cannot
+        # place has to appear in the return value; a field that is neither in
+        # the document nor in the losses is the defect the audit found.
+        source, back, losses = roundtripped
+        for table, key in (("line", "id"), ("scheduled_stop_point", "id"),
+                           ("service_journey", "id")):
+            for row in source.db.get_records(table):
+                after = back.db.get_one(table, {key: row[key]})
+                if after is None:
+                    continue
+                for field, before in row.items():
+                    if field == "extras" or before in (None, ""):
+                        continue
+                    if after.get(field) in (None, ""):
+                        assert f"unsupported_field_{table}_{field}" in losses, (
+                            f"{table}.{field} left the document uncounted")
+
+    def test_entities_with_no_netex_home_are_counted_whole(self, roundtripped):
+        # Fares, pathways, levels and attributions have no element this writer
+        # emits at all. That is a decision, not an accident, and it is a number.
+        source, _, losses = roundtripped
+        for table in ("fare_attribute", "fare_rule", "pathway", "level",
+                      "stop_area", "attribution"):
+            expected = source.db.count(table)
+            if expected:
+                assert losses.get(f"unsupported_{table}") == expected, table
+
+
 class TestSchemaMigration:
     def test_31_database_gains_new_columns(self, tmp_path):
         db_path = tmp_path / "old.db"

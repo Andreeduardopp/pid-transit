@@ -213,10 +213,10 @@ class _RunState:
     def __init__(self):
         self.stats: Dict[str, int] = {}
         # pass-1 lookup maps
-        self.stop_places: Dict[str, tuple] = {}     # id -> (name, lat, lon, wheelchair)
-        self.quays: Dict[str, tuple] = {}           # id -> (name, lat, lon, wheelchair)
+        self.stop_places: Dict[str, tuple] = {}     # id -> (name, lat, lon, wheelchair, code)
+        self.quays: Dict[str, tuple] = {}           # id -> (name, lat, lon, wheelchair, code)
         self.assignments: Dict[str, str] = {}       # ssp id -> quay/stop place id
-        self.ssp_points: Dict[str, tuple] = {}      # ssp id -> (name, QuayRef attr)
+        self.ssp_points: Dict[str, tuple] = {}      # ssp id -> (name, QuayRef attr, code)
         self.route_to_line: Dict[str, str] = {}     # Route id -> Line id
         self.line_ids: set = set()
         self.day_type_ids: set = set()
@@ -239,6 +239,14 @@ class _RunState:
         # different files, so both are buffered and joined at flush time.
         self.link_geometry: Dict[str, List[tuple]] = {}   # link id -> [(lat, lon), ...]
         self.jp_links: Dict[str, List[str]] = {}          # pattern id -> ordered link ids
+        # The document's own locale, from CompositeFrame/FrameDefaults. A NeTEx
+        # time is a local time and this is the only place the file says which
+        # local, so it is read before any operator is written and applied to all
+        # of them; `fallback_timezone` is what a file that states none gets.
+        self.default_timezone: Optional[str] = None
+        self.default_language: Optional[str] = None
+        # The feed's provenance, from the ResourceFrame's DataSource.
+        self.feed_info: Optional[dict] = None
         # pass-1 row buffers (small entities, flushed once)
         self.operators: List[dict] = []
         self.day_types: Dict[str, dict] = {}        # id -> row (dates may be updated)
@@ -308,7 +316,10 @@ class NetexImporter:
                  profile: "NetexProfile | str | None" = None):
         """
         Args:
-            fallback_timezone: timezone assigned to operators (NeTEx has none).
+            fallback_timezone: timezone for operators when the document states
+                none. A NeTEx file that carries FrameDefaults/DefaultLocale/
+                TimeZone states one, and it wins: every time in the file is
+                local to it, so taking UTC instead shifts the whole timetable.
             profile: force a `NetexProfile` instead of detecting one. Detection
                 is structural and reliable on the feeds we have, but a caller
                 who knows what they were sent should be able to say so -- and a
@@ -410,8 +421,8 @@ class NetexImporter:
                  "Skipped %d service journeys with unresolvable line references"),
                 (LOSS_JOURNEY_NO_ID, pass2.journeys_without_id,
                  "Skipped %d service journeys with no usable id"),
-                (LOSS_PASSING_TIME_NO_STOP, pass2.dropped_call_stops,
-                 "Dropped %d call passing times referencing unknown stops"),
+                (LOSS_PASSING_TIME_NO_STOP, pass2.dropped_stop_times,
+                 "Dropped %d passing times referencing unknown stops"),
             ):
                 if count:
                     state.add_stat(key, count)
@@ -501,18 +512,65 @@ class NetexImporter:
         # Handlers read self._ns at call time; _stream sets it from the first
         # start event, before any handler fires.
 
+        def on_frame_defaults(fd: ET.Element) -> None:
+            """The document's locale. Ends before the frames it applies to, but
+            it is kept in state and applied at flush anyway: a producer is free
+            to put FrameDefaults on an inner frame, and pass 1 has read every
+            file by the time the operators are written."""
+            locale = fd.find("n:DefaultLocale", self._ns)
+            if locale is None:
+                return
+            if state.default_timezone is None:
+                state.default_timezone = _text(locale.find("n:TimeZone", self._ns))
+            if state.default_language is None:
+                state.default_language = _text(
+                    locale.find("n:DefaultLanguage", self._ns))
+
+        def on_data_source(ds: ET.Element) -> None:
+            """A DataSource as the feed's provenance — GTFS feed_info.
+
+            DataSource is generic in NeTEx, so the reading is gated on the shape
+            our own exporter writes: a Name *and* a Url, which are the publisher
+            and publisher_url that a feed_info row cannot exist without. A
+            DataSource carrying only a name is some other producer's bookkeeping
+            and is left alone.
+            """
+            did = ds.attrib.get("id")
+            name = _text(ds.find("n:Name", self._ns))
+            url = _text(ds.find("n:Url", self._ns))
+            if not (did and name and url) or state.feed_info is not None:
+                return
+            start = end = None
+            valid = ds.find("n:ValidBetween", self._ns)
+            if valid is not None:
+                start = _date_from_iso(_text(valid.find("n:FromDate", self._ns)))
+                end = _date_from_iso(_text(valid.find("n:ToDate", self._ns)))
+            state.feed_info = {
+                "id": did,
+                "publisher_name": name,
+                "publisher_url": url,
+                "start_date": start,
+                "end_date": end,
+                "version": self._key_value(ds, "gtfs_feed_version"),
+                "contact_email": _text(ds.find("n:Email", self._ns)),
+                "contact_url": self._key_value(ds, "gtfs_feed_contact_url"),
+            }
+
         def on_operator(op: ET.Element) -> None:
             oid = op.attrib.get("id", "UNKNOWN")
             name = _text(op.find("n:Name", self._ns)) or "Unnamed"
-            phone = None
+            phone = url = None
             contact = op.find("n:ContactDetails", self._ns)
             if contact is not None:
                 phone = _text(contact.find("n:Phone", self._ns))
+                url = _text(contact.find("n:Url", self._ns))
+            # No timezone yet: it comes from the document's FrameDefaults, which
+            # may be read after this element, and is filled in at flush.
             state.operators.append({
                 "id": oid,
                 "name": name,
-                "timezone": self.fallback_timezone,
                 "phone": phone,
+                "url": url,
             })
 
         def on_stop_place(sp: ET.Element) -> None:
@@ -522,6 +580,7 @@ class NetexImporter:
             lat, lon = self._centroid_coords(sp, f"StopPlace {sid}")
             state.stop_places[sid] = (
                 _text(sp.find("n:Name", self._ns)), lat, lon, self._access_int(sp),
+                _text(sp.find("n:PrivateCode", self._ns)),
             )
 
         def on_quay(q: ET.Element) -> None:
@@ -531,6 +590,7 @@ class NetexImporter:
             lat, lon = self._centroid_coords(q, f"Quay {qid}")
             state.quays[qid] = (
                 _text(q.find("n:Name", self._ns)), lat, lon, self._access_int(q),
+                _text(q.find("n:PrivateCode", self._ns)),
             )
 
         def on_assignment(pa: ET.Element) -> None:
@@ -555,6 +615,10 @@ class NetexImporter:
             state.ssp_points[sid] = (
                 _text(ssp.find("n:Name", self._ns)),
                 ssp.attrib.get("QuayRef"),
+                # The PT profile puts the rider-facing code here; EPIP puts it
+                # on the StopPlace. Whichever the file used, it is the same
+                # GTFS stop_code, so both are read and the nearer one wins.
+                _text(ssp.find("n:PrivateCode", self._ns)),
             )
 
         def on_line(line: ET.Element) -> None:
@@ -562,15 +626,34 @@ class NetexImporter:
             if not lid:
                 return
             op_ref = line.find("n:OperatorRef", self._ns)
+            if op_ref is None:
+                # The Portuguese profile's only concrete Organisation is the
+                # Authority, and its Line names it with AuthorityRef. Both are
+                # a reference to the row this model calls an operator, so both
+                # are read; OperatorRef wins where a feed states both.
+                op_ref = line.find("n:AuthorityRef", self._ns)
+            # ShortName or PublicCode: the same datum in two slots, and which
+            # one a file uses is the profile's choice, so both are read.
+            short_name = (_text(line.find("n:ShortName", self._ns))
+                          or _text(line.find("n:PublicCode", self._ns)))
+            colour = text_colour = None
+            presentation = line.find("n:Presentation", self._ns)
+            if presentation is not None:
+                colour = _text(presentation.find("n:Colour", self._ns))
+                text_colour = _text(presentation.find("n:TextColour", self._ns))
             state.line_ids.add(lid)
             state.lines.append({
                 "id": lid,
                 "operator_id": op_ref.attrib.get("ref") if op_ref is not None else None,
                 "name": _text(line.find("n:Name", self._ns)) or "Unnamed",
-                "short_name": _text(line.find("n:ShortName", self._ns)),
+                "short_name": short_name,
                 "transport_mode": _normalize_mode(
                     _text(line.find("n:TransportMode", self._ns))
                 ),
+                "description": _text(line.find("n:Description", self._ns)),
+                "url": _text(line.find("n:Url", self._ns)),
+                "color": colour,
+                "text_color": text_colour,
             })
 
         def on_route(route: ET.Element) -> None:
@@ -660,6 +743,11 @@ class NetexImporter:
             # the same four fields, so all four are collected and the adapter
             # decides which one the file is making.
             state.evidence.availability_conditions += 1
+            bits = _text(c.find("n:ValidDayBits", self._ns))
+            if bits:
+                # Counted before the id check: a condition without an id still
+                # says which of the two readings this file is written in.
+                state.evidence.availability_conditions_with_bits += 1
             cid = c.attrib.get("id")
             if not cid:
                 return
@@ -667,7 +755,7 @@ class NetexImporter:
             state.avail_conditions[cid] = (
                 _date_from_iso(_text(c.find("n:FromDate", self._ns))),
                 _date_from_iso(_text(c.find("n:ToDate", self._ns))),
-                _text(c.find("n:ValidDayBits", self._ns)),
+                bits,
                 _text(c.find("n:IsAvailable", self._ns)) != "false",
             )
 
@@ -795,6 +883,7 @@ class NetexImporter:
             q_lr = f"{{{uri}}}LineRef"
             q_jpv = f"{{{uri}}}JourneyPatternView"
             q_calls = f"{{{uri}}}calls"
+            q_day_types = f"{{{uri}}}dayTypes"
             jp = sjp = lr = None
             for child in sj:
                 tag = child.tag
@@ -802,6 +891,12 @@ class NetexImporter:
                     ev.journeys_with_pattern_view += 1
                 elif tag == q_calls:
                     ev.journeys_with_calls += 1
+                elif tag == q_day_types:
+                    # Whether the journey names its own calendar. A profile that
+                    # pairs journeys to calendars by document position needs to
+                    # know how many journeys actually lack the reference, not
+                    # how many exist.
+                    ev.journeys_with_day_type += 1
             for child in sj:
                 tag = child.tag
                 if tag == q_jp:
@@ -826,7 +921,13 @@ class NetexImporter:
                 state.jp_to_line[jp] = lr
 
         return {
+            "FrameDefaults": on_frame_defaults,
+            "DataSource": on_data_source,
             "Operator": on_operator,
+            # An Authority is an Organisation with the same fields this model
+            # keeps on an operator. The Portuguese profile lists no Operator at
+            # all, so a feed written to it had every organisation dropped.
+            "Authority": on_operator,
             "StopPlace": on_stop_place,
             "Quay": on_quay,
             "PassengerStopAssignment": on_assignment,
@@ -850,6 +951,20 @@ class NetexImporter:
         }
 
     def _flush_reference_data(self, db: TransmodelDatabase, state: _RunState) -> None:
+        # The document's locale reaches the rows here, after pass 1 has seen
+        # every file: FrameDefaults may sit on any frame, and an operator read
+        # before it must not be stamped with the fallback and left there.
+        timezone_name = state.default_timezone or self.fallback_timezone
+        for op in state.operators:
+            op["timezone"] = timezone_name
+            op.setdefault("lang", state.default_language)
+        if state.feed_info is not None:
+            state.feed_info["lang"] = state.default_language or ""
+            state.add_stat("feed_info",
+                           db.upsert("feed_info", [state.feed_info], validate=False))
+            logger.info("Imported feed info for %s",
+                        state.feed_info["publisher_name"])
+            state.feed_info = None
         if state.operators:
             state.add_stat("operator", db.upsert("operator", state.operators, validate=False))
             logger.info("Imported %d operators", len(state.operators))
@@ -897,12 +1012,15 @@ class NetexImporter:
         # the shared reading below exactly as it did before this seam existed.
         resolution = state.adapter.resolve_calendar(
             state.calendar_frames, state.day_types, state.avail_conditions,
-            state.evidence.journeys,
+            state.evidence.journeys - state.evidence.journeys_with_day_type,
         )
         exceptions.extend(resolution.exceptions)
         state.journey_day_types = resolution.journey_day_types
         for note in resolution.notes:
             logger.warning("%s profile: %s", state.profile.value, note)
+        for key, count in resolution.losses.items():
+            state.add_stat(key, count)
+            logger.warning("%s profile: %s = %d", state.profile.value, key, count)
         state.calendar_frames = []
 
         for cid, (c_from, c_to, bits, _available) in state.avail_conditions.items():
@@ -1109,33 +1227,47 @@ class NetexImporter:
     def _resolve_stops(self, state: _RunState) -> List[dict]:
         stops = []
         if state.ssp_points:
-            for sid, (ssp_name, quay_ref_attr) in state.ssp_points.items():
+            for sid, (ssp_name, quay_ref_attr, ssp_code) in state.ssp_points.items():
                 # Resolution priority: assignment -> Quay/StopPlace, then the
                 # SSP's own QuayRef attribute (our exporter emits this), then a
                 # StopPlace sharing the SSP id (our exporter's round-trip case).
+                #
+                # The winner supplies name and coordinates, but the whole chain
+                # is searched for the rider-facing code: EPIP binds the point to
+                # a Quay and puts the code on the StopPlace above it, so
+                # stopping at the first match read the Quay and lost the code.
                 site = None
+                site_code = ssp_code
                 for ref in (state.assignments.get(sid), quay_ref_attr, sid):
-                    if ref:
-                        site = state.quays.get(ref) or state.stop_places.get(ref)
-                        if site is not None:
-                            break
+                    if not ref:
+                        continue
+                    candidate = state.quays.get(ref) or state.stop_places.get(ref)
+                    if candidate is None:
+                        continue
+                    if site is None:
+                        site = candidate
+                    if site_code is None:
+                        site_code = candidate[4]
                 name = ssp_name or (site[0] if site else None)
-                lat, lon, wheelchair = (site[1], site[2], site[3]) if site else (None, None, None)
+                lat, lon, wheelchair = (
+                    site[1], site[2], site[3]
+                ) if site else (None, None, None)
                 if lat is None or lon is None:
                     logger.warning("No coordinates resolved for ScheduledStopPoint %s", sid)
                 stops.append({
                     "id": sid, "name": name or "Unnamed", "lat": lat, "lon": lon,
                     "wheelchair_boarding": wheelchair,
+                    "code": site_code,
                 })
         else:
             # No ScheduledStopPoint elements: fall back to importing StopPlaces
             # directly (minimal feeds where patterns reference StopPlace ids).
-            for sid, (name, lat, lon, wheelchair) in state.stop_places.items():
+            for sid, (name, lat, lon, wheelchair, code) in state.stop_places.items():
                 if lat is None or lon is None:
                     logger.warning("No coordinates for StopPlace %s", sid)
                 stops.append({
                     "id": sid, "name": name or "Unnamed", "lat": lat, "lon": lon,
-                    "wheelchair_boarding": wheelchair,
+                    "wheelchair_boarding": wheelchair, "code": code,
                 })
         return stops
 
@@ -1152,7 +1284,12 @@ class _Pass2:
         self.frequencies: List[dict] = []
         self.missing_day_types: set = set()
         self.skipped_journeys = 0
-        self.dropped_call_stops = 0
+        # Stop times whose stop could not be resolved, in either shape the
+        # profiles use: a Call naming an unknown ScheduledStopPoint, or a
+        # TimetabledPassingTime whose StopPointInJourneyPatternRef resolves to
+        # no point of the pattern. Both drop a time from the timetable, so both
+        # answer the same question and share one key.
+        self.dropped_stop_times = 0
         self.journeys_without_id = 0
         self.adapter = state.adapter
         # Day types to pair with journeys by document position, for the profiles
@@ -1416,7 +1553,9 @@ class _Pass2:
                     elif tag == q_dep_off:
                         dep_off_text = _text(c)
 
-                if stop_id:
+                if not stop_id:
+                    self.dropped_stop_times += 1
+                else:
                     self.passing_times.append({
                         "service_journey_id": sjid,
                         "stop_point_id": stop_id,
@@ -1457,7 +1596,7 @@ class _Pass2:
                     elif tag == q_dep_el:
                         dep_el = c
                 if stop_id and stop_id not in stop_ids:
-                    self.dropped_call_stops += 1
+                    self.dropped_stop_times += 1
                     stop_id = None
                 if stop_id:
                     self.passing_times.append({

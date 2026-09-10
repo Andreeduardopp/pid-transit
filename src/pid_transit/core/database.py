@@ -8,7 +8,7 @@ with full referential integrity.
 import sqlite3
 import logging
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -620,6 +620,88 @@ class TransmodelDatabase:
         try:
             cur = conn.execute(sql, params)
             return cur.fetchone()[0]
+        finally:
+            self._release(conn)
+
+    def count_non_null(self, table_name: str, columns: Sequence[str]) -> Dict[str, int]:
+        """How many rows carry a value in each of `columns`.
+
+        One aggregate over the table for all of them, not one query per column:
+        the caller is asking about a whole table at once -- which of its fields
+        an export could not carry -- and a separate pass over passing_time is a
+        scan a production feed can feel.
+
+        Empty strings count as absent, like NULL: a GTFS reader writes `''` for
+        a column the source left blank, and reporting those as data lost would
+        be reporting a loss that is not one. A zero is a value and is counted;
+        NULLIF compares across storage classes, so an integer 0 never matches.
+        """
+        self._check_table(table_name)
+        # Filtered against the model, not interpolated as given: these names go
+        # into the SQL text, and the model's field list is the only source for
+        # them that the caller cannot influence.
+        known = TRANSMODEL_ENTITIES[table_name].model_fields
+        cols = [c for c in columns if c in known]
+        if not cols:
+            return {}
+        selects = ", ".join(f"""COUNT(NULLIF("{c}", ''))""" for c in cols)
+        conn = self.connect()
+        try:
+            row = conn.execute(f"SELECT {selects} FROM {table_name}").fetchone()
+            return {c: row[i] for i, c in enumerate(cols)}
+        finally:
+            self._release(conn)
+
+    def transport_modes_by_stop_point(self) -> Dict[str, str]:
+        """The transport mode serving each stop point, by the lines calling there.
+
+        One grouped join rather than three `get_records` calls and a nested
+        walk: the result is keyed by stop, so it scales with the network and
+        not with the timetable. A stop served by lines of several modes gets
+        the mode of the most journey-pattern points, ties broken by name so the
+        answer does not depend on row order.
+
+        Stops no pattern calls at are absent -- the model has nothing to say
+        about them and the caller decides what to do with that.
+        """
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT p.stop_point_id, l.transport_mode, COUNT(*) AS n "
+                "FROM point_in_journey_pattern p "
+                "JOIN journey_pattern j ON j.id = p.journey_pattern_id "
+                "JOIN line l ON l.id = j.line_id "
+                "WHERE l.transport_mode IS NOT NULL "
+                "GROUP BY p.stop_point_id, l.transport_mode"
+            ).fetchall()
+        finally:
+            self._release(conn)
+        best: Dict[str, tuple] = {}
+        for stop_id, mode, n in rows:
+            rank = (n, mode)
+            if stop_id not in best or rank > best[stop_id]:
+                best[stop_id] = rank
+        return {stop_id: rank[1] for stop_id, rank in best.items()}
+
+    def count_distinct(self, table_name: str, column: str) -> int:
+        """How many distinct values `column` holds, as one aggregate.
+
+        The alternative a caller reaches for is `{r[col] for r in
+        get_records(table)}`, which materialises the whole table to learn one
+        number -- and `shape_point` is the table where that is worst: millions
+        of rows read into dicts to count a few thousand shapes.
+        """
+        self._check_table(table_name)
+        # The column name goes into the SQL text, so it comes from the model
+        # rather than from the caller.
+        if column not in TRANSMODEL_ENTITIES[table_name].model_fields:
+            raise ValueError(f"{table_name} has no column {column!r}")
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                f'SELECT COUNT(DISTINCT "{column}") FROM {table_name}'
+            ).fetchone()
+            return row[0]
         finally:
             self._release(conn)
 

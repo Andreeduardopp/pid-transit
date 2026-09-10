@@ -41,12 +41,20 @@ DEFAULT_END_DATE = "20991231"
 # change how the other million are read.
 _MAJORITY = 0.5
 
-# The Portuguese profile emits one ServiceCalendarFrame per journey, holding a
-# handful of conditions each. A frame with thousands is a whole-network calendar
-# -- the Swiss feed has exactly one, with 69 634 conditions -- and grouping it
-# serves no profile, so collection stops rather than hold a national calendar in
-# memory to answer a question nobody asks of it.
-MAX_CONDITIONS_PER_FRAME = 64
+# A frame with thousands of conditions is a whole-network calendar -- the Swiss
+# feed has exactly one, with 69 634 -- and grouping it serves no profile, so
+# collection stops rather than hold a national calendar in memory to answer a
+# question nobody asks of it.
+#
+# The cap was 64, sized on the CARRIS file's handful of conditions per frame.
+# That is a property of one producer, not of the profile: a per-day-type
+# calendar legitimately carries one condition per exception date, which for a
+# year of school holidays is comfortably into the hundreds, and this library's
+# own PT export writes exactly that shape. At 64 those frames overflowed and
+# their exceptions were silently re-read as day types that no journey runs on.
+# 4096 still rejects the Swiss national frame by seventeen times over, and the
+# ids held are a few hundred kilobytes at worst.
+MAX_CONDITIONS_PER_FRAME = 4096
 
 
 class NetexProfile(Enum):
@@ -90,8 +98,15 @@ class ProfileEvidence:
     journeys_with_calls: int = 0
     journeys_with_line_ref: int = 0
     journeys_with_pattern_ref: int = 0
+    journeys_with_day_type: int = 0
     journey_patterns: int = 0
     availability_conditions: int = 0
+    #: Of those, how many carry a ValidDayBits mask. This is the field that
+    #: separates the two incompatible readings of AvailabilityCondition -- a
+    #: window plus a bitmask (Swiss) against a single-date exception carrying
+    #: IsAvailable (Portuguese) -- so it, not the bare count, is what the rules
+    #: below may key on.
+    availability_conditions_with_bits: int = 0
     service_calendar_frames: int = 0
     codespaces: set = field(default_factory=set)
 
@@ -109,15 +124,38 @@ class ProfileEvidence:
             return NetexProfile.GENERIC
         most = self.journeys * _MAJORITY
 
-        # Journeys with no id at all cannot be stored or referenced, and the
-        # pattern lives inline as a JourneyPatternView instead of being a
-        # standalone element. Both have to be worked around together.
-        if self.journeys_without_id > most and self.journeys_with_pattern_view > most:
+        # The pattern lives inline as a JourneyPatternView instead of being a
+        # standalone element -- the one structural feature the Portuguese
+        # profile *specifies* (its ServiceFrame admits no journeyPatterns at
+        # all), and one no other dialect here uses: measured zero across 9 056
+        # journeys in three Swiss timetable files spanning the feed.
+        #
+        # Missing journey ids used to be required here as well. That was
+        # reading a defect for a feature: the profile makes `id` 1:1 and it is
+        # the IMT's example file that omits it, so requiring both made a
+        # conformant PT feed -- including one this library exports -- undetectable.
+        if self.journeys_with_pattern_view > most:
+            return NetexProfile.PORTUGUESE
+
+        # One ServiceCalendarFrame per day type, holding availability
+        # conditions that carry no bitmask: the calendar shape only this
+        # profile writes, and the one that survives when the journeys have no
+        # pattern to view. A PT feed whose patterns this library never
+        # recovered -- which is every PT feed, since the profile declares none
+        # (matrix D5) -- re-exports without a single JourneyPatternView, so the
+        # rule above cannot see it and this one has to.
+        if (self.service_calendar_frames > 1
+                and self.availability_conditions
+                and not self.availability_conditions_with_bits):
             return NetexProfile.PORTUGUESE
 
         # Calendars as validity windows plus a day bitmask, and stop times as
-        # inline calls rather than TimetabledPassingTime.
-        if self.availability_conditions and self.journeys_with_calls > most:
+        # inline calls rather than TimetabledPassingTime. The bitmask is the
+        # load-bearing half: it is what makes the Swiss reading incompatible
+        # with the Portuguese one, and keying on the bare presence of an
+        # AvailabilityCondition claimed every PT feed for this branch.
+        if (self.availability_conditions_with_bits
+                and self.journeys_with_calls > most):
             return NetexProfile.SWISS_SKI
 
         # The line is named two hops up, by the pattern's Route, and never on
@@ -137,9 +175,11 @@ class ProfileEvidence:
             f"{self.journeys_with_pattern_view} with inline pattern view, "
             f"{self.journeys_with_calls} with calls, "
             f"{self.journeys_with_line_ref} with direct LineRef, "
-            f"{self.journeys_with_pattern_ref} with pattern ref), "
+            f"{self.journeys_with_pattern_ref} with pattern ref, "
+            f"{self.journeys_with_day_type} with a day type of their own), "
             f"{self.journey_patterns} journey patterns, "
-            f"{self.availability_conditions} availability conditions, "
+            f"{self.availability_conditions} availability conditions "
+            f"({self.availability_conditions_with_bits} with a day bitmask), "
             f"{self.service_calendar_frames} service calendar frames"
         )
 
@@ -195,6 +235,10 @@ class CalendarResolution:
     claimed_conditions: set = field(default_factory=set)
     journey_day_types: Optional[List[str]] = None
     notes: List[str] = field(default_factory=list)
+    #: What the profile saw and could not turn into anything, by
+    #: `dropped_`-prefixed key. Folded into the import's returned stats, so a
+    #: calendar the reader gave up on is a number and not only a log line.
+    losses: Dict[str, int] = field(default_factory=dict)
 
 
 class ProfileAdapter:
@@ -214,9 +258,15 @@ class ProfileAdapter:
         frames: Sequence[CalendarFrame],
         day_types: Dict[str, dict],
         conditions: Dict[str, tuple],
-        journey_count: int,
+        unpaired_journeys: int,
     ) -> CalendarResolution:
         """Interpret the ServiceCalendarFrames pass 1 grouped.
+
+        `unpaired_journeys` counts the journeys that named no day type of their
+        own -- the only ones a positional pairing could be *for*. It is not the
+        journey total: a file whose journeys all carry a `DayTypeRef` needs no
+        pairing, and a profile must not warn about failing to build one nobody
+        asked for.
 
         May fill *missing* dates in `day_types` in place -- never overwrite one
         the file stated. Everything else it wants done comes back in the result.
@@ -284,10 +334,19 @@ class PortugueseAdapter(ProfileAdapter):
 
     profile = NetexProfile.PORTUGUESE
 
-    def resolve_calendar(self, frames, day_types, conditions, journey_count):
+    def resolve_calendar(self, frames, day_types, conditions, unpaired_journeys):
         res = CalendarResolution()
         order: List[str] = []
         for frame in frames:
+            if frame.overflowed:
+                # More conditions than one frame is collected for, so the
+                # grouping this profile depends on was never built. Its
+                # conditions still reach the shared path, but as day types
+                # rather than as the exception dates they are -- a real loss,
+                # and one the caller gets a number for instead of a silence.
+                res.losses["dropped_calendar_frame_too_large"] = (
+                    res.losses.get("dropped_calendar_frame_too_large", 0) + 1)
+                continue
             if not frame.is_per_journey():
                 # Not the per-journey shape this profile emits. Left to the
                 # shared path rather than guessed at.
@@ -323,15 +382,20 @@ class PortugueseAdapter(ProfileAdapter):
                 })
                 res.claimed_conditions.add(cid)
 
-        if not order:
+        if not order or not unpaired_journeys:
+            # Nothing to pair, or nothing that needs pairing. The second case is
+            # the conformant one: the profile makes the journey's
+            # `dayTypes/DayTypeRef` mandatory, so a file that states it -- which
+            # the IMT example does not, and this library's own PT export does --
+            # is read by reference and never comes near this guess.
             return res
-        if len(order) == journey_count:
+        if len(order) == unpaired_journeys:
             res.journey_day_types = order
         else:
             res.notes.append(
-                f"{len(order)} per-journey calendar frames for {journey_count} "
-                "journeys; cannot pair them by position, journeys will have no "
-                "day type"
+                f"{len(order)} per-journey calendar frames for "
+                f"{unpaired_journeys} journeys that name no day type; cannot "
+                "pair them by position, those journeys will have no day type"
             )
         return res
 

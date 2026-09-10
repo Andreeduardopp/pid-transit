@@ -116,10 +116,16 @@ class TransitDataset:
         from ..adapters.gtfs_exporter import GtfsExporter
         self.export_data(GtfsExporter(**exporter_kwargs), target)
 
-    def to_netex(self, target: Union[str, Path], **exporter_kwargs) -> None:
-        """Export this dataset to NeTEx XML."""
+    def to_netex(self, target: Union[str, Path], **exporter_kwargs):
+        """Export this dataset to NeTEx XML.
+
+        ``profile="pt"`` writes the Portuguese national profile instead of the
+        default EPIP. Returns what the chosen profile could not represent, as
+        ``{"unsupported_<entity>": count}`` — a restriction that cannot carry
+        journey patterns says so here rather than dropping them quietly.
+        """
         from ..adapters.netex_exporter import NetexExporter
-        self.export_data(NetexExporter(**exporter_kwargs), target)
+        return self.export_data(NetexExporter(**exporter_kwargs), target)
 
     def import_data(self, importer, source: Union[str, Path]) -> Dict[str, int]:
         """
@@ -138,15 +144,20 @@ class TransitDataset:
             logger.error(f"Import failed: {e}")
             raise ImportFailedError(f"Import failed: {e}") from e
 
-    def export_data(self, exporter, target: Union[str, Path]) -> None:
+    def export_data(self, exporter, target: Union[str, Path]):
         """
         Export data using a provided exporter adapter.
-        
+
         Args:
             exporter: An instance of an Exporter class (e.g., GtfsExporter)
             target: Path to save the exported data.
+
+        Returns:
+            Whatever the exporter reports it could not represent, as a dict of
+            counts, or None for exporters that report nothing. The NeTEx
+            exporter uses it for profile losses (``unsupported_`` keys).
         """
-        exporter.export_from_db(self.db, target)
+        return exporter.export_from_db(self.db, target)
 
     def validate(self, min_severity=None):
         """Run logical validation on the dataset.

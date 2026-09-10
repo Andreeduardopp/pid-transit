@@ -14,6 +14,12 @@ if TYPE_CHECKING:
     # Static mirror of the lazy map below, so type checkers and IDEs still
     # resolve every public name. Kept in sync by tests/test_lazy_imports.py.
     from .core.dataset import TransitDataset
+    from .convert import (
+        ConversionResult,
+        convert,
+        gtfs_to_netex,
+        netex_to_gtfs,
+    )
     from .adapters.gtfs_importer import GtfsImporter
     from .adapters.gtfs_exporter import GtfsExporter
     from .adapters.netex_importer import NetexImporter
@@ -63,6 +69,7 @@ __version__ = "0.7.0"
 # Submodule -> the public names it defines. Resolved on first access.
 _LAZY_MODULES: dict[str, tuple[str, ...]] = {
     ".core.dataset": ("TransitDataset",),
+    ".convert": ("ConversionResult", "convert", "gtfs_to_netex", "netex_to_gtfs"),
     ".adapters.gtfs_importer": ("GtfsImporter",),
     ".adapters.gtfs_exporter": ("GtfsExporter",),
     ".adapters.netex_importer": ("NetexImporter",),
@@ -138,6 +145,10 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "TransitDataset",
+    "ConversionResult",
+    "convert",
+    "gtfs_to_netex",
+    "netex_to_gtfs",
     "GtfsImporter",
     "GtfsExporter",
     "NetexImporter",

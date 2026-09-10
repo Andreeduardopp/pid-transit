@@ -13,7 +13,7 @@ A professional transit data library based on the Transmodel / NeTEx conceptual m
 - **Analytics**: Built-in operational statistics (headways, vehicle-hours, service spans, stop coverage), feed comparison/diff, and GTFS-RT readiness checks.
 - **GTFS-Realtime**: Fetch and parse TripUpdate / VehiclePosition / Alert feeds, then match them against the static dataset to report trip and stop resolution rates and delay distributions.
 - **Multi-Feed Merge**: Combine feeds from different operators with ID namespacing and Haversine-based stop deduplication.
-- **CLI Tool**: Nine commands — `import`, `export`, `validate`, `stats`, `diff`, `merge`, `normalize`, `frequencies`, and the `rt-*` real-time checks.
+- **CLI Tool**: Thirteen commands — `import`, `export`, `convert` (feed file straight to feed file), `validate`, `netex-check`, `stats`, `diff`, `merge`, `normalize`, `frequencies`, `roundtrip`, and the `rt-*` real-time checks.
 - **Spreadsheet Import**: Load transit data directly from Excel workbooks or CSV folders.
 - **Data Validation**: 20 rules over the Transmodel database — V01–V15 structural (FK integrity, required fields, passing-time order) and V16–V20 semantic (implied-speed plausibility, duplicate stops, orphan inventory, frequency sanity), filterable by severity.
 - **NeTEx Profile Detection**: National profiles differ enough to break naive readers. The importer identifies the dialect from the document's structure and adapts — CEN/EPIP-generic, Swiss SKI, the French/European indirection, and the Portuguese IMT profile. See [NeTEx profiles](#netex-profiles).
@@ -363,6 +363,47 @@ The `deduplicate_patterns` option groups journey patterns with identical stop se
 
 The export includes calendar validity (`ValidBetween`) and exceptions (`DayTypeAssignment`), shapes (`LinkSequenceProjection` with `gml:posList` on the journey pattern), transfers (`Connection`), frequencies (`TemplateServiceJourney`/`HeadwayJourneyGroup`), and wheelchair accessibility (`AccessibilityAssessment`) — all of which the NeTEx importer reads back, so GTFS → NeTEx → GTFS round-trips are lossless for these fields (`bikes_allowed` is GTFS-only).
 
+### Converting a feed in one call
+
+Import-then-export is the general path, and it is the right one when the database is also
+going to be validated, merged or queried. When all you want is *this file, in that
+format*, `pid_transit.convert` is that pipeline with the database kept in memory:
+
+```python
+from pid_transit import gtfs_to_netex, netex_to_gtfs, convert
+
+# Target defaults to <source>.netex.xml, written beside the source
+result = gtfs_to_netex("feed.zip")
+print(result.target)              # feed.netex.xml
+
+# Or name it, and choose the profile to write
+result = gtfs_to_netex("feed.zip", "carris.xml", profile="pt")
+result = netex_to_gtfs("netex.zip", "feed.zip")
+
+# The generic form also reads CSV/XLSX and rewrites one NeTEx profile as another
+convert("tables.xlsx", "feed.zip")
+convert("epip.xml", "pt.xml", write_profile="pt")
+```
+
+Formats are detected from the source when you do not name them — and a `.zip` is decided
+by **opening it and looking at its members**, since GTFS and NeTEx both ship inside one.
+Pass `source_format=` / `target_format=` to name them outright.
+
+What was lost travels in the return value rather than only in the log:
+
+```python
+result = gtfs_to_netex("feed.zip", profile="pt")
+
+result.imported            # {'line': 71, 'service_journey': 10238, ...}
+result.not_imported        # what the source held and the model could not read
+result.not_representable   # what the model held and the profile cannot say
+result.has_losses          # False when both are empty
+result.db                  # None unless db= asked for a file
+```
+
+Pass `db="city.db"` to keep the intermediate database instead of discarding it — the
+conversion then costs you nothing extra if you also want to validate or query the feed.
+
 ### Importing from CSV or Excel
 
 ```python
@@ -608,6 +649,13 @@ pid-transit export --db city.db --format netex --output export.xml.gz --compress
 
 # Disable journey pattern deduplication
 pid-transit export --db city.db --format netex --output export.xml --no-dedup
+
+# Convert a feed straight into another format (no database left behind)
+pid-transit convert feed.zip --to netex                  # writes feed.netex.xml
+pid-transit convert netex.xml -o feed.zip                # format read from the name
+pid-transit convert feed.zip -o carris.xml --profile pt  # Portuguese profile
+pid-transit convert feed.zip -o out.xml.gz               # .gz implies --compress
+pid-transit convert feed.zip --to netex --db city.db     # keep the database too
 
 # Expand frequency windows into concrete journeys (or compress them back)
 pid-transit frequencies city.db --expand

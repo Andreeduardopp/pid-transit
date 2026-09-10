@@ -10,29 +10,16 @@ from pathlib import Path
 
 def cmd_import(args):
     from .core.dataset import TransitDataset
+    from .convert import make_importer
 
-    dataset = TransitDataset(args.db)
-
-    fmt = args.format
-    if fmt == "gtfs":
-        from .adapters.gtfs_importer import GtfsImporter
-        importer = GtfsImporter(fallback_timezone=args.timezone)
-    elif fmt == "netex":
-        from .adapters.netex_importer import NetexImporter
-        importer = NetexImporter(
-            fallback_timezone=args.timezone,
-            profile=getattr(args, "profile", None),
-        )
-    elif fmt == "csv":
-        from .adapters.spreadsheet_importer import SpreadsheetImporter
-        importer = SpreadsheetImporter(format="csv")
-    elif fmt == "xlsx":
-        from .adapters.spreadsheet_importer import SpreadsheetImporter
-        importer = SpreadsheetImporter(format="xlsx")
-    else:
-        print(f"Unknown format: {fmt}", file=sys.stderr)
+    try:
+        importer = make_importer(args.format, fallback_timezone=args.timezone,
+                                 profile=getattr(args, "profile", None))
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
         sys.exit(1)
 
+    dataset = TransitDataset(args.db)
     stats = dataset.import_data(importer, args.source)
     from .adapters.netex_importer import LOSS_PREFIXES
 
@@ -50,27 +37,99 @@ def cmd_import(args):
             print(f"  {reason}: {count:,}")
 
 
+def _print_export_losses(losses: dict) -> None:
+    """Print what an export could not say, split by why it could not.
+
+    Two lists, because a reader has two different things to do about them. A
+    profile with no slot for something is answered by choosing another profile;
+    a datum that would not fit a slot the profile does have is answered by
+    fixing the feed. One list would flatten the difference away.
+    """
+    from .adapters.netex_export_profiles import DROPPED_PREFIX
+
+    dropped = {k: v for k, v in losses.items() if k.startswith(DROPPED_PREFIX)}
+    unsupported = {k: v for k, v in losses.items() if k not in dropped}
+    for title, group in (
+        ("Not representable in this profile:", unsupported),
+        ("Dropped (the profile has the slot; this data did not fit it):", dropped),
+    ):
+        if group:
+            print(title)
+            for what, count in sorted(group.items()):
+                print(f"  {what}: {count:,}")
+
+
 def cmd_export(args):
     from .core.dataset import TransitDataset
+    from .convert import make_exporter
 
-    dataset = TransitDataset(args.db)
-
-    fmt = args.format
-    if fmt == "gtfs":
-        from .adapters.gtfs_exporter import GtfsExporter
-        exporter = GtfsExporter(include_shapes=not args.no_shapes)
-    elif fmt == "netex":
-        from .adapters.netex_exporter import NetexExporter
-        exporter = NetexExporter(
-            deduplicate_patterns=not args.no_dedup,
-            compress=args.compress,
-        )
-    else:
-        print(f"Unknown format: {fmt}", file=sys.stderr)
+    try:
+        exporter = make_exporter(args.format,
+                                 profile=getattr(args, "profile", None),
+                                 include_shapes=not args.no_shapes,
+                                 deduplicate_patterns=not args.no_dedup,
+                                 compress=args.compress)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
         sys.exit(1)
 
-    dataset.export_data(exporter, args.output)
+    dataset = TransitDataset(args.db)
+    losses = dataset.export_data(exporter, args.output)
     print(f"Exported to {args.output}")
+    if losses:
+        # Printed apart, like the importer's "Not imported": these are things
+        # the database holds and the document does not say.
+        _print_export_losses(losses)
+
+
+def cmd_convert(args):
+    """Convert a feed file straight into another format.
+
+    `import` then `export` with the database in memory, so a one-off conversion
+    does not leave a .db behind unless --db asks for one.
+    """
+    from .convert import convert
+
+    if not args.output and not args.target_format:
+        # Caught here rather than in convert(), so the message names the flags
+        # the user typed instead of the library's keyword arguments.
+        print("Pass --output, --to, or both", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        result = convert(
+            args.source,
+            args.output,
+            source_format=args.source_format,
+            target_format=args.target_format,
+            db=args.db or ":memory:",
+            fallback_timezone=args.timezone,
+            read_profile=args.read_profile,
+            write_profile=args.profile,
+            include_shapes=not args.no_shapes,
+            deduplicate_patterns=not args.no_dedup,
+            # None lets the target's own name decide; the flag forces it on.
+            compress=True if args.compress else None,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Converted {result.source} ({result.source_format}) -> "
+          f"{result.target} ({result.target_format})")
+    if result.db is not None:
+        print(f"Intermediate database kept at {result.db}")
+    for table, count in sorted(result.imported.items()):
+        print(f"  {table}: {count:,}")
+    if result.not_imported:
+        # Two different losses, printed apart: what the source file held and
+        # the model could not read...
+        print("Not imported:")
+        for reason, count in sorted(result.not_imported.items()):
+            print(f"  {reason}: {count:,}")
+    if result.not_representable:
+        # ...and what the model held and the target document does not say.
+        _print_export_losses(result.not_representable)
 
 
 def cmd_validate(args):
@@ -105,6 +164,34 @@ def cmd_validate(args):
                   f"[{issue.entity_type}] {issue.entity_id}: {issue.message}")
 
     sys.exit(0 if not errors else 1)
+
+
+def cmd_netex_check(args):
+    """Check a NeTEx file against a profile, without importing it."""
+    from .adapters.netex_check import check_netex
+
+    try:
+        report = check_netex(
+            args.source,
+            profile=args.profile,
+            with_schema=args.xsd,
+            with_readability=args.read,
+            xsd_path=args.xsd_path,
+            xsd_locate=args.xsd_locate,
+            check_references=not args.no_refs,
+        )
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(report.to_markdown())
+
+    # Exit code reflects errors only. A file with info-level findings — which
+    # is what the readability layer produces — is still conformant.
+    sys.exit(0 if report.is_conformant else 1)
 
 
 def cmd_stats(args):
@@ -397,11 +484,53 @@ def main():
     p_export.add_argument("--output", "-o", required=True, help="Output file path")
     p_export.add_argument("--no-shapes", action="store_true",
                           help="Exclude shapes.txt from GTFS export (included by default)")
+    p_export.add_argument("--profile", default="epip",
+                          choices=["epip", "pt"],
+                          help="NeTEx profile to write (netex only): 'epip' "
+                               "(default) or 'pt' for the Portuguese national "
+                               "profile")
     p_export.add_argument("--no-dedup", action="store_true",
                           help="Disable journey pattern deduplication in NeTEx")
     p_export.add_argument("--compress", action="store_true",
                           help="Gzip the NeTEx output")
     p_export.set_defaults(func=cmd_export)
+
+    # convert
+    p_convert = subparsers.add_parser(
+        "convert",
+        help="Convert a feed file directly into another format "
+             "(import + export, without keeping a database)")
+    p_convert.add_argument("source", help="Path to the feed to convert")
+    p_convert.add_argument("--to", dest="target_format",
+                           choices=["gtfs", "netex"],
+                           help="Output format. Read from --output when "
+                                "omitted; required if --output is too")
+    p_convert.add_argument("--from", dest="source_format",
+                           choices=["gtfs", "netex", "csv", "xlsx"],
+                           help="Input format. Detected from the source when "
+                                "omitted (a .zip by what it contains)")
+    p_convert.add_argument("--output", "-o",
+                           help="Output path (default: <source>.gtfs.zip or "
+                                "<source>.netex.xml, beside the source)")
+    p_convert.add_argument("--db",
+                           help="Keep the intermediate database at this path "
+                                "(it lives in memory by default)")
+    p_convert.add_argument("--timezone", default="UTC", help="Fallback timezone")
+    p_convert.add_argument("--read-profile", dest="read_profile", default=None,
+                           choices=[p.value for p in NetexProfile],
+                           help="Force a NeTEx dialect for reading instead of "
+                                "detecting one from the document's shape")
+    p_convert.add_argument("--profile", default=None, choices=["epip", "pt"],
+                           help="NeTEx profile to write (netex output only): "
+                                "'epip' (default) or 'pt'")
+    p_convert.add_argument("--no-shapes", action="store_true",
+                           help="Exclude shapes.txt from a GTFS output")
+    p_convert.add_argument("--no-dedup", action="store_true",
+                           help="Disable journey pattern deduplication in NeTEx")
+    p_convert.add_argument("--compress", action="store_true",
+                           help="Gzip the NeTEx output (implied by an output "
+                                "named .gz)")
+    p_convert.set_defaults(func=cmd_convert)
 
     # validate
     p_validate = subparsers.add_parser("validate", help="Run logical validation on a database")
@@ -412,6 +541,36 @@ def main():
                             dest="min_severity",
                             help="Only report issues at or above this severity")
     p_validate.set_defaults(func=cmd_validate)
+
+    # netex-check
+    p_check = subparsers.add_parser(
+        "netex-check",
+        help="Check a NeTEx file against a profile without importing it")
+    p_check.add_argument("source", help="Path to the NeTEx .xml (or .zip)")
+    p_check.add_argument("--profile", default="epip", choices=["epip", "pt"],
+                         help="Profile to check against (default epip)")
+    p_check.add_argument("--xsd", action="store_true",
+                         help="Also validate against the CEN XSD. Needs the "
+                              "'xsd' extra (lxml) and is slow: 3-9 min for a "
+                              "174 MB file")
+    p_check.add_argument("--xsd-locate", dest="xsd_locate",
+                         action="store_true",
+                         help="Report a line number for each XSD finding. "
+                              "Requires validating a built tree instead of "
+                              "streaming, which is several times slower "
+                              "(~56 min for a 174 MB file, measured once)")
+    p_check.add_argument("--xsd-path", dest="xsd_path",
+                         help="Path to NeTEx_publication.xsd (defaults to the "
+                              "vendored CEN 1.3 tree)")
+    p_check.add_argument("--read", action="store_true",
+                         help="Also report what this library's importer could "
+                              "not read out of the file")
+    p_check.add_argument("--no-refs", action="store_true",
+                         help="Skip dangling-reference checking (it holds every "
+                              "declared and referenced id in memory)")
+    p_check.add_argument("--json", action="store_true",
+                         help="Emit the report as JSON")
+    p_check.set_defaults(func=cmd_netex_check)
 
     # stats
     p_stats = subparsers.add_parser("stats", help="Show operational statistics")

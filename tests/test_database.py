@@ -240,3 +240,53 @@ class TestDelete:
     def test_delete_requires_where(self, populated_db):
         with pytest.raises(ValueError):
             populated_db.delete("operator", where={})
+
+
+class TestAggregateCounts:
+    def test_count_distinct_does_not_read_the_rows(self, db):
+        db.upsert("shape_point", [
+            {"shape_id": f"SH{i % 3}", "lat": 40.0 + j, "lon": -8.0, "sequence": j}
+            for i in range(3) for j in range(4)
+        ])
+        assert db.count("shape_point") == 12
+        assert db.count_distinct("shape_point", "shape_id") == 3
+
+    def test_count_distinct_refuses_a_column_the_model_has_not_got(self, db):
+        with pytest.raises(ValueError, match="nonesuch"):
+            db.count_distinct("shape_point", "nonesuch")
+
+    def test_modes_by_stop_point_follows_the_lines_that_call_there(self, db):
+        db.upsert("operator", [{"id": "OP", "name": "Op", "timezone": "UTC"}])
+        db.upsert("line", [
+            {"id": "LM", "operator_id": "OP", "name": "M", "transport_mode": "metro"},
+            {"id": "LB", "operator_id": "OP", "name": "B", "transport_mode": "bus"},
+        ])
+        db.upsert("scheduled_stop_point", [
+            {"id": "SM", "name": "M"}, {"id": "SB", "name": "B"},
+            {"id": "SX", "name": "Unserved"},
+        ])
+        db.upsert("journey_pattern", [{"id": "JM", "line_id": "LM"},
+                                      {"id": "JB", "line_id": "LB"}])
+        db.upsert("point_in_journey_pattern", [
+            {"journey_pattern_id": "JM", "stop_point_id": "SM", "order": 0},
+            {"journey_pattern_id": "JB", "stop_point_id": "SB", "order": 0},
+        ])
+        # A stop no pattern calls at is absent rather than guessed at.
+        assert db.transport_modes_by_stop_point() == {"SM": "metro", "SB": "bus"}
+
+    def test_a_stop_served_by_two_modes_takes_the_busier_one(self, db):
+        db.upsert("operator", [{"id": "OP", "name": "Op", "timezone": "UTC"}])
+        db.upsert("line", [
+            {"id": "LM", "operator_id": "OP", "name": "M", "transport_mode": "metro"},
+            {"id": "LB", "operator_id": "OP", "name": "B", "transport_mode": "bus"},
+        ])
+        db.upsert("scheduled_stop_point", [{"id": "S", "name": "Interchange"}])
+        db.upsert("journey_pattern", [{"id": "JM", "line_id": "LM"},
+                                      {"id": "JB1", "line_id": "LB"},
+                                      {"id": "JB2", "line_id": "LB"}])
+        db.upsert("point_in_journey_pattern", [
+            {"journey_pattern_id": "JM", "stop_point_id": "S", "order": 0},
+            {"journey_pattern_id": "JB1", "stop_point_id": "S", "order": 0},
+            {"journey_pattern_id": "JB2", "stop_point_id": "S", "order": 0},
+        ])
+        assert db.transport_modes_by_stop_point() == {"S": "bus"}

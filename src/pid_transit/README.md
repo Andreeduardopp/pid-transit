@@ -75,7 +75,10 @@ Isolam **toda** a lógica específica de cada formato, para que o core permaneç
 | **`gtfs_importer.py`** | GTFS `.zip` → banco | Divide `stops.txt` por `location_type`; gera um `JourneyPattern` sintético por trip (`JP_{trip_id}`); popula `PointInJourneyPattern` (sequência) e `PassingTime` (horários). |
 | **`gtfs_exporter.py`** | banco → GTFS `.zip` | Reúne `ScheduledStopPoint` + `StopArea` de volta em `stops.txt` com os `location_type` corretos; escreve todos os arquivos GTFS padrão, incluindo `shapes.txt`, `frequencies.txt`, `transfers.txt`. |
 | **`netex_importer.py`** | NeTEx XML → banco | Detecta o namespace automaticamente; reconstrói tempos a partir de `DayOffset`; preserva `JourneyPattern`s nativos diretamente (sem síntese). |
-| **`netex_exporter.py`** | banco → NeTEx XML | Monta a estrutura multi-frame (Resource / Site / Service / ServiceCalendar / Timetable); flag opcional `deduplicate_patterns` colapsa patterns idênticos em canônicos; normaliza `25:30:00 → (01:30:00, DayOffset=1)`. |
+| **`netex_exporter.py`** | banco → NeTEx XML | Monta a estrutura multi-frame (Resource / Site / Service / ServiceCalendar / Timetable); `profile=` escolhe o dialeto escrito; flag opcional `deduplicate_patterns` colapsa patterns idênticos em canônicos; normaliza `25:30:00 → (01:30:00, DayOffset=1)`. Devolve o que o perfil escolhido **não conseguiu representar**, sob chaves `unsupported_`. |
+| **`netex_profiles.py`** | — | Como **ler** cada dialeto NeTEx. `NetexProfile` (enum) + deteção **estrutural** (nunca por codespace ou nome de ficheiro) + uma hierarquia de `ProfileAdapter` cujos hooks são todos inertes por omissão — um dialeto novo não pode mudar como os existentes são lidos. |
+| **`netex_export_profiles.py`** | — | Como **escrever** cada perfil. `ExportProfile` (a implementação de referência EPIP), `EpipProfile` e `PortugueseExportProfile`. Ao contrário do importador, a base não pode ser inerte — algum elemento *tem* de ser escrito —, por isso a base **é** o EPIP e a subclasse restringe-o. |
+| **`netex_check.py`** | NeTEx XML → relatório | Verifica um ficheiro contra um perfil **sem o importar**, em três camadas separadas (`profile`, `schema`, `readability`), com os achados agrupados por causa. 6–12 s / 26 MB para um ficheiro de 173 MB, contra 3–9 min do XSD (que era 56 min antes de a validação passar a correr em streaming). A camada `schema` precisa do extra `pip install pid-transit[xsd]` e **diz** quando não pôde correr. |
 | **`spreadsheet_importer.py`** | CSV / XLSX → banco | Entrada via planilha — uma workbook Excel (uma aba por tabela) ou uma pasta de CSVs. |
 | **`gtfs_rt.py`** | GTFS-Realtime → memória | **Não segue o contrato de importer** de propósito: tempo real é um overlay efêmero, não um formato de arquivo. `fetch_snapshot(url_ou_arquivo)` baixa e parseia um `FeedMessage` protobuf num `RtSnapshot` (trip updates, posições de veículos, alertas); `match_snapshot(snapshot, dataset)` faz o join contra o dataset estático (`trip_id → ServiceJourney`, com fallback por rota + horário de partida para serviço por frequência) e produz um `RtMatchReport` com taxas de match e resumo de atrasos. Nada é persistido. Requer o extra opcional `pip install pid-transit[rt]`. |
 
@@ -96,6 +99,25 @@ Ferramentas que recebem um `TransitDataset` já carregado e produzem relatórios
 
 ---
 
+## `convert.py` — conversões de ficheiro para ficheiro
+
+Uma camada fina por cima dos adapters, sem lógica de tradução própria: importa para um banco **em memória** e exporta logo a seguir, que é o caso comum de "quero este ficheiro naquele formato" sem querer um `.db` no fim.
+
+```python
+from pid_transit import gtfs_to_netex, netex_to_gtfs, convert
+
+result = gtfs_to_netex("feed.zip")                        # escreve feed.netex.xml
+result = gtfs_to_netex("feed.zip", "carris.xml", profile="pt")
+result = netex_to_gtfs("netex.zip", "feed.zip")
+convert("epip.xml", "pt.xml", write_profile="pt")         # reescreve o perfil
+```
+
+O formato de origem é detetado quando não é nomeado — e um `.zip` decide-se **abrindo o arquivo e contando os seus membros**, já que GTFS e NeTEx viajam ambos dentro de um; contado, não pelo primeiro que casa, porque feeds reais carregam ficheiros avulsos. O `ConversionResult` devolvido separa o que foi importado (`imported`) do que se perdeu na entrada (`not_imported`, chaves `skipped_`/`dropped_`) e do que o perfil de destino não sabe dizer (`not_representable`, chaves `unsupported_`). `db=` guarda o banco intermediário em vez de o descartar.
+
+As fábricas `make_importer(fmt, …)` / `make_exporter(fmt, …)` que este módulo usa são as mesmas que o `cli.py` usa em `import`/`export` — o mapa formato → adapter existe num sítio só.
+
+---
+
 ## `cli.py` — interface de linha de comando
 
 Expõe as operações principais no terminal via o entry point `pid-transit` (definido no `pyproject.toml`):
@@ -103,6 +125,8 @@ Expõe as operações principais no terminal via o entry point `pid-transit` (de
 ```bash
 pid-transit import feed.zip --format gtfs --db city.db
 pid-transit export --db city.db --format netex --output feed.xml
+pid-transit convert feed.zip --to netex                  # ficheiro → ficheiro, sem banco
+pid-transit convert feed.zip -o carris.xml --profile pt
 pid-transit validate city.db
 pid-transit stats city.db --line L_10 --day-type WEEKDAY
 pid-transit diff january.db february.db --output report.md
@@ -113,7 +137,7 @@ pid-transit rt-snapshot https://api.example.com/gtfs-rt.pb --db city.db --header
 
 ## Caminho rápido pelo código
 
-1. Comece por **`core/dataset.py`** (`TransitDataset`) — é a fachada e a porta de entrada de praticamente tudo.
+1. Comece por **`core/dataset.py`** (`TransitDataset`) — é a fachada e a porta de entrada de praticamente tudo; **`convert.py`** mostra o pipeline completo em vinte linhas.
 2. Veja **`core/schemas.py`** para entender o vocabulário de domínio (as entidades Transmodel).
 3. Siga um fluxo concreto: **`adapters/gtfs_importer.py`** (entrada) → banco → **`adapters/netex_exporter.py`** (saída) mostra a tradução de formato de ponta a ponta.
 4. **`analytics/`** e **`core/validator.py`** são consumidores do dataset — leia depois de entender o modelo.

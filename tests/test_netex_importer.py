@@ -68,6 +68,8 @@ class TestNetexImporter:
             "stops": [
                 {"stop_id": "S1", "stop_name": "Stop",
                  "stop_lat": "40.0", "stop_lon": "-74.0", "location_type": "0"},
+                {"stop_id": "S2", "stop_name": "Stop Two",
+                 "stop_lat": "40.1", "stop_lon": "-74.1", "location_type": "0"},
             ],
             "routes": [{"route_id": "R1", "agency_id": "A1",
                         "route_short_name": "1", "route_long_name": "Route",
@@ -77,9 +79,14 @@ class TestNetexImporter:
                           "saturday": "0", "sunday": "0",
                           "start_date": "20260101", "end_date": "20261231"}],
             "trips": [{"trip_id": "T1", "route_id": "R1", "service_id": "WD"}],
+            # Two stops, because a NeTEx JourneyPattern sequences two points or
+            # none (CEN minOccurs="2") and a one-stop trip is not a journey.
+            # The subject here is the >24h time, which either stop carries.
             "stop_times": [
                 {"trip_id": "T1", "stop_id": "S1", "stop_sequence": "1",
                  "arrival_time": "25:30:00", "departure_time": "25:30:00"},
+                {"trip_id": "T1", "stop_id": "S2", "stop_sequence": "2",
+                 "arrival_time": "25:45:00", "departure_time": "25:45:00"},
             ],
         }
         zip_path = tmp_path / "feed.zip"
@@ -745,7 +752,8 @@ class TestShapeGeometryOnServiceLinks:
         assert frame is not None
         emitted = [child.tag.replace(ns, "") for child in frame]
 
-        expected_order = ["lines", "scheduledStopPoints", "serviceLinks",
+        expected_order = ["ValidBetween", "TypeOfFrameRef", "lines",
+                          "scheduledStopPoints", "serviceLinks",
                           "connections", "stopAssignments", "journeyPatterns"]
         assert "connections" in emitted, "fixture must exercise the transfers path"
         assert emitted == [tag for tag in expected_order if tag in emitted]
@@ -1264,12 +1272,17 @@ def _pt_journey(line, stop_a: str, stop_b: str, t1: str, t2: str) -> str:
 
 def _pt_netex(n_journeys: int = 2, n_calendars: int = None, conditions=(),
               nested_calendar: bool = False, line: str = "193008",
-              n_identified: int = 0) -> str:
+              n_identified: int = 0, n_without_view: int = 0,
+              day_type_refs: bool = False) -> str:
     """Portuguese-profile feed. `n_calendars` defaults to one per journey; pass
     a different number to break the pairing the importer relies on.
 
-    `n_identified` gives that many journeys an id of their own, so a feed can be
-    built that carries the profile's shape only as a minority.
+    `n_identified` gives that many journeys an id of their own.
+    `n_without_view` strips the inline JourneyPatternView from that many, which
+    is the element detection actually turns on, so a feed can be built that
+    carries the profile's shape only as a minority.
+    `day_type_refs` adds the `dayTypes/DayTypeRef` the profile makes mandatory
+    and the IMT's file omits -- the shape a conformant producer writes.
     """
     count = n_journeys if n_calendars is None else n_calendars
     keys = [f"2821{i:04d}" for i in range(count)]
@@ -1277,12 +1290,24 @@ def _pt_netex(n_journeys: int = 2, n_calendars: int = None, conditions=(),
         _pt_calendar_frame(k, conditions=conditions, nested=nested_calendar)
         for k in keys
     )
-    journeys = "\n".join(
-        _pt_journey(line, "1_801", "1_817", f"0{8 + i}:00:00", f"0{8 + i}:05:00")
-        .replace("<ServiceJourney>", f'<ServiceJourney id="own:{i}" version="any">',
-                 1 if i < n_identified else 0)
-        for i in range(n_journeys)
-    )
+    def _journey(i: int) -> str:
+        text = _pt_journey(line, "1_801", "1_817",
+                           f"0{8 + i}:00:00", f"0{8 + i}:05:00")
+        text = text.replace(
+            "<ServiceJourney>", f'<ServiceJourney id="own:{i}" version="any">',
+            1 if i < n_identified else 0)
+        if i < n_without_view:
+            text = text.replace(
+                '<JourneyPatternView><RouteRef ref="route:1"/></JourneyPatternView>',
+                f'<JourneyPatternRef ref="jp:{i}"/>')
+        if day_type_refs:
+            text = text.replace(
+                "<DirectionType>",
+                f'<dayTypes><DayTypeRef ref="dt:{keys[i % len(keys)]}"/></dayTypes>'
+                "<DirectionType>")
+        return text
+
+    journeys = "\n".join(_journey(i) for i in range(n_journeys))
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <PublicationDelivery xmlns="http://www.netex.org.uk/netex" version="1.1">
  <dataObjects>
@@ -1558,18 +1583,31 @@ class TestDetectionUsesRatios:
     """A rule fires on the shape of most journeys, not on the first element that
     matches: real feeds carry strays."""
 
-    def test_a_stray_id_less_journey_does_not_flip_the_profile(self, db, tmp_path):
-        # Three of four journeys name themselves. The one that does not must not
-        # decide how the other three are read.
+    def test_a_stray_pattern_view_does_not_flip_the_profile(self, db, tmp_path):
+        # Three of four journeys use a standalone JourneyPatternRef. The one
+        # that carries an inline view must not decide how the other three are
+        # read.
         path = tmp_path / "mixed.xml"
-        path.write_text(_pt_netex(n_journeys=4, n_identified=3), encoding="utf-8")
+        path.write_text(_pt_netex(n_journeys=4, n_without_view=3), encoding="utf-8")
         importer = NetexImporter()
         importer.import_to_db(db, path)
         assert importer.last_profile is not NetexProfile.PORTUGUESE
 
     def test_the_majority_shape_still_wins(self, db, tmp_path):
         path = tmp_path / "mostly.xml"
-        path.write_text(_pt_netex(n_journeys=4, n_identified=1), encoding="utf-8")
+        path.write_text(_pt_netex(n_journeys=4, n_without_view=1), encoding="utf-8")
+        importer = NetexImporter()
+        importer.import_to_db(db, path)
+        assert importer.last_profile is NetexProfile.PORTUGUESE
+
+    def test_journey_ids_do_not_decide_the_profile(self, db, tmp_path):
+        # The IMT's file omits the journey id, but the profile makes it 1:1 --
+        # so a *conformant* PT feed has ids on every journey, and must still be
+        # recognised. Requiring missing ids read a defect of one producer as a
+        # feature of the profile, and made this library's own PT export
+        # undetectable by its own importer.
+        path = tmp_path / "conformant.xml"
+        path.write_text(_pt_netex(n_journeys=4, n_identified=4), encoding="utf-8")
         importer = NetexImporter()
         importer.import_to_db(db, path)
         assert importer.last_profile is NetexProfile.PORTUGUESE

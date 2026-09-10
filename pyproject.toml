@@ -46,10 +46,18 @@ dependencies = [
 rt = [
     "gtfs-realtime-bindings>=1.0",
 ]
+# XSD validation for `netex-check --xsd`. Kept out of the runtime dependencies
+# on purpose: two dependencies is a competitive property of this library, and
+# one subcommand does not get to spend it. Without the extra, netex-check runs
+# its profile rules and says explicitly that it could not check the schema.
+xsd = [
+    "lxml>=4.9",
+]
 dev = [
     "pytest>=7",
     "hypothesis>=6",
     "gtfs-realtime-bindings>=1.0",
+    "lxml>=4.9",
 ]
 
 [project.urls]
