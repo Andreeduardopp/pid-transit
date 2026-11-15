@@ -143,7 +143,10 @@ def validate_transmodel(
                 prev_secs = secs
 
     # --- V03: Every Line has at least one JourneyPattern ---
-    for line in lines:
+    # A dataset with no journey patterns at all comes from a source that does
+    # not model them (the Portuguese NeTEx profile, for one): there the rule
+    # says nothing about any single line, and V11 still catches empty lines.
+    for line in (lines if patterns else ()):
         if line["id"] not in jp_line_ids:
             report._append(ValidationIssue(
                 entity_type="line",

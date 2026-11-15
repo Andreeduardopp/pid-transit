@@ -80,13 +80,20 @@ class SpreadsheetImporter:
         return stats
 
     def _import_workbook(self, wb, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
+        by_entity = {}
         for sheet_name in wb.sheetnames:
             entity_name = sheet_name.lower().strip()
             if entity_name not in TRANSMODEL_ENTITIES:
                 logger.warning("Skipping sheet '%s', not a recognized Transmodel entity.", sheet_name)
                 continue
+            by_entity[entity_name] = sheet_name
 
-            sheet = wb[sheet_name]
+        # Registry order is foreign-key safe (operator before line, and so on);
+        # the order of the sheets in the workbook is whatever the author chose.
+        for entity_name in TRANSMODEL_ENTITIES:
+            if entity_name not in by_entity:
+                continue
+            sheet = wb[by_entity[entity_name]]
             rows = list(sheet.iter_rows(values_only=True))
             if len(rows) < 2:
                 continue
@@ -94,14 +101,15 @@ class SpreadsheetImporter:
             headers = [str(h).strip() for h in rows[0] if h is not None]
             records = []
             for row in rows[1:]:
-                if not any(row):  # skip empty rows
+                if all(v is None or str(v).strip() == "" for v in row):  # skip empty rows
                     continue
                 record = {}
                 for i, val in enumerate(row):
-                    if i < len(headers):
-                        # Convert all values to strings/None as per DB expectations,
-                        # though Pydantic handles coercion.
-                        record[headers[i]] = str(val).strip() if val is not None else None
+                    # An empty cell is left out, so the model default applies
+                    # (None for optional fields, "" for the key parts of
+                    # composite keys such as translation.record_sub_id).
+                    if i < len(headers) and val is not None and str(val).strip() != "":
+                        record[headers[i]] = str(val).strip()
                 records.append(record)
 
             if records:
@@ -109,12 +117,20 @@ class SpreadsheetImporter:
                 stats[entity_name] = inserted
 
     def _import_csv_dir(self, path: Path, db: TransmodelDatabase, stats: Dict[str, int]) -> None:
-        for file_path in path.glob("*.csv"):
+        by_entity = {}
+        for file_path in sorted(path.glob("*.csv")):
             entity_name = file_path.stem.lower().strip()
             if entity_name not in TRANSMODEL_ENTITIES:
                 logger.warning("Skipping file '%s', not a recognized Transmodel entity.", file_path.name)
                 continue
+            by_entity[entity_name] = file_path
 
+        # Registry order is foreign-key safe; glob order is alphabetical at best
+        # and would load line.csv before the operator.csv it refers to.
+        for entity_name in TRANSMODEL_ENTITIES:
+            if entity_name not in by_entity:
+                continue
+            file_path = by_entity[entity_name]
             try:
                 with open(file_path, "r", encoding="utf-8-sig") as f:
                     reader = csv.DictReader(f)
@@ -123,8 +139,8 @@ class SpreadsheetImporter:
                         # Clean up keys and values
                         clean_row = {}
                         for k, v in row.items():
-                            if k:
-                                clean_row[k.strip()] = v.strip() if v else None
+                            if k and v is not None and v.strip() != "":
+                                clean_row[k.strip()] = v.strip()
                         records.append(clean_row)
 
                     if records:

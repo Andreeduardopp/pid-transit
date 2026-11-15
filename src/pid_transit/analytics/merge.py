@@ -23,9 +23,8 @@ _ID_TABLES = [
 
 _FK_MAP = {
     "line": {"operator_id": "operator"},
-    "stop_area": {"level_id": "level"},
-    "pathway": {"from_stop_id": "scheduled_stop_point",
-                "to_stop_id": "scheduled_stop_point"},
+    "scheduled_stop_point": {"stop_area_id": "stop_area"},
+    "stop_area": {"level_id": "level", "parent_id": "stop_area"},
     "journey_pattern": {"line_id": "line"},
     "service_journey": {"line_id": "line", "journey_pattern_id": "journey_pattern",
                         "day_type_id": "day_type"},
@@ -79,8 +78,10 @@ class FeedMerger:
             )
 
         # 2. Process ID tables in FK-safe order
+        # level and stop_area come before the stop points that sit in them.
         ordered_tables = [
-            "feed_info", "operator", "scheduled_stop_point", "day_type",
+            "feed_info", "operator", "level", "stop_area",
+            "scheduled_stop_point", "pathway", "day_type",
             "line", "journey_pattern", "service_journey",
         ]
 
@@ -106,6 +107,17 @@ class FeedMerger:
                         new_rec[fk_field] = id_remap[ref_table].get(
                             new_rec[fk_field], f"{prefix}{new_rec[fk_field]}"
                         )
+                if table == "pathway":
+                    # A pathway end is a stop point or a stop area, and a stop
+                    # point may have been folded into a target stop by proximity.
+                    for end in ("from_stop_id", "to_stop_id"):
+                        old = rec[end]
+                        new_rec[end] = id_remap["scheduled_stop_point"].get(
+                            old, f"{prefix}{old}")
+                if table == "service_journey" and new_rec.get("shape_id"):
+                    # shape_point.shape_id is namespaced in step 4; the trip's
+                    # reference has to follow it or every trip loses its shape.
+                    new_rec["shape_id"] = f"{prefix}{new_rec['shape_id']}"
                 new_records.append(new_rec)
 
             if new_records:
