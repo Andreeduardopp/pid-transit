@@ -65,6 +65,18 @@ before tasks are generated. A fresh clone will not have it — reinstall with
   seam that does not exist, add the seam to the base with an inert default and
   override it in the one subclass. `adapters/netex_profiles.py` is the worked
   example (`ProfileAdapter` + `NetexProfile`).
+- **Writing a dialect inverts the inertness, and that is fine.** A reader's base
+  class can answer "nothing to do" everywhere, because reading nothing is safe.
+  A writer's cannot — some element gets written — so in
+  `adapters/netex_export_profiles.py` the base **is** the reference profile
+  (EPIP) and `EpipProfile` is the empty subclass that names it. The safety
+  property is unchanged (a new profile only overrides its own answers); what
+  proves it is that the default output stayed byte-identical when the mechanism
+  was introduced, which is a test, not a claim.
+- Detection rules must key on what a profile **specifies**, never on what one
+  producer's file happens to do. Missing `id`s were read as the Portuguese
+  profile's signature; they are a defect of the IMT's example, and keying on
+  them made a conformant PT feed — including our own export — undetectable.
 - Detect a variant from the document's **structure**, never from a codespace, a
   file name or an id prefix — those are labels the producer chose. Group what
   belongs together by XML containment, not by a shared id suffix, and fire the

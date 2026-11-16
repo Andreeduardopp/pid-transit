@@ -61,8 +61,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Andreeduardopp/PID-Toolkit"
-Issues = "https://github.com/Andreeduardopp/PID-Toolkit/issues"
+Repository = "https://github.com/Andreeduardopp/pid-transit"
+Issues = "https://github.com/Andreeduardopp/pid-transit/issues"
 
 [project.scripts]
 pid-transit = "pid_transit.cli:main"
