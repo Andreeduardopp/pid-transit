@@ -182,3 +182,12 @@ research/
 # Config, templates, scripts e a constituição do projeto. Reinstalável com
 # `specify init --here`. As skills correspondentes já saem por .claude/.
 .specify/
+
+# Measurement outputs. research/revisao_fase3/PLANO_MEDICOES.md writes its
+# round trips, profile checks, merges and spreadsheet runs here, which is
+# hundreds of megabytes of exported feeds -- and hatchling's sdist takes
+# whatever git does not ignore, so untracked is not enough: a release built
+# with out_r1/ present shipped a 228 MB sdist.
+out_r1/
+out_f3/
+out_roundtrip/
