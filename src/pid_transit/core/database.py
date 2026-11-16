@@ -661,8 +661,22 @@ class TransmodelDatabase:
         the mode of the most journey-pattern points, ties broken by name so the
         answer does not depend on row order.
 
-        Stops no pattern calls at are absent -- the model has nothing to say
-        about them and the caller decides what to do with that.
+        A journey that carries its own calls instead of referencing a shared
+        pattern is not absent from the network, so it is asked the same
+        question the other way round: the line whose journeys call there. That
+        second path exists because a whole profile is built this way -- the
+        Portuguese profile's `JourneyPatternView` + `calls` leaves
+        `point_in_journey_pattern` empty for the entire feed, and without it
+        every stop in such a feed is typed "other" (2 300 of them on Carris de
+        Lisboa) while the Line beside it correctly says bus or tram.
+
+        It is asked only when pattern-less journeys exist, and only for stops
+        the pattern path did not answer for, so a feed whose journeys all carry
+        a pattern runs exactly the one query it always ran and gets exactly the
+        map it always got.
+
+        Stops neither a pattern nor a journey calls at are absent -- the model
+        has nothing to say about them and the caller decides what to do.
         """
         conn = self.connect()
         try:
@@ -674,6 +688,19 @@ class TransmodelDatabase:
                 "WHERE l.transport_mode IS NOT NULL "
                 "GROUP BY p.stop_point_id, l.transport_mode"
             ).fetchall()
+            pattern_less = conn.execute(
+                "SELECT 1 FROM service_journey "
+                "WHERE journey_pattern_id IS NULL LIMIT 1"
+            ).fetchone()
+            call_rows = conn.execute(
+                "SELECT t.stop_point_id, l.transport_mode, COUNT(*) AS n "
+                "FROM passing_time t "
+                "JOIN service_journey s ON s.id = t.service_journey_id "
+                "JOIN line l ON l.id = s.line_id "
+                "WHERE s.journey_pattern_id IS NULL "
+                "AND l.transport_mode IS NOT NULL "
+                "GROUP BY t.stop_point_id, l.transport_mode"
+            ).fetchall() if pattern_less else ()
         finally:
             self._release(conn)
         best: Dict[str, tuple] = {}
@@ -681,6 +708,16 @@ class TransmodelDatabase:
             rank = (n, mode)
             if stop_id not in best or rank > best[stop_id]:
                 best[stop_id] = rank
+        # Gap-filling only: a stop some pattern calls at keeps the pattern's
+        # answer, so the two paths cannot outvote each other.
+        gaps: Dict[str, tuple] = {}
+        for stop_id, mode, n in call_rows:
+            if stop_id in best:
+                continue
+            rank = (n, mode)
+            if stop_id not in gaps or rank > gaps[stop_id]:
+                gaps[stop_id] = rank
+        best.update(gaps)
         return {stop_id: rank[1] for stop_id, rank in best.items()}
 
     def count_distinct(self, table_name: str, column: str) -> int:

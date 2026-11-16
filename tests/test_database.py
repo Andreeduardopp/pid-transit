@@ -290,3 +290,90 @@ class TestAggregateCounts:
             {"journey_pattern_id": "JB2", "stop_point_id": "S", "order": 0},
         ])
         assert db.transport_modes_by_stop_point() == {"S": "bus"}
+
+    # ------------------------------------------------------------------ #
+    # Feeds whose journeys carry their own calls instead of a pattern.
+    # The Portuguese profile is built this way (JourneyPatternView +
+    # calls), so `point_in_journey_pattern` is empty for a whole feed.
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _pattern_less_feed(db, modes=(("LB", "bus"), ("LT", "tram"))):
+        db.upsert("operator", [{"id": "OP", "name": "Op", "timezone": "UTC"}])
+        db.upsert("line", [{"id": lid, "operator_id": "OP", "name": lid,
+                            "transport_mode": mode} for lid, mode in modes])
+        db.upsert("day_type", [{"id": "WD", "monday": True,
+                                "start_date": "20260101", "end_date": "20261231"}])
+
+    def test_modes_by_stop_point_follows_the_calls_when_there_is_no_pattern(self, db):
+        self._pattern_less_feed(db)
+        db.upsert("scheduled_stop_point", [
+            {"id": "SB", "name": "Bus stop"}, {"id": "ST", "name": "Tram stop"},
+            {"id": "SX", "name": "Unserved"},
+        ])
+        db.upsert("service_journey", [
+            {"id": "JB", "line_id": "LB", "day_type_id": "WD",
+             "departure_time": "08:00:00"},
+            {"id": "JT", "line_id": "LT", "day_type_id": "WD",
+             "departure_time": "09:00:00"},
+        ])
+        db.upsert("passing_time", [
+            {"service_journey_id": "JB", "stop_point_id": "SB", "order": 0},
+            {"service_journey_id": "JT", "stop_point_id": "ST", "order": 0},
+        ])
+        assert db.count("point_in_journey_pattern") == 0
+        # Without this path every stop in such a feed is typed "other".
+        assert db.transport_modes_by_stop_point() == {"SB": "bus", "ST": "tram"}
+
+    def test_the_call_path_leaves_a_pattern_bearing_feed_alone(self, db):
+        """The inertness property: no pattern-less journey, no second answer.
+
+        A feed whose journeys all reference a pattern must get exactly the map
+        it got before the call path existed -- including leaving a stop its
+        patterns do not call at absent, however many passing times name it.
+        """
+        self._pattern_less_feed(db)
+        db.upsert("scheduled_stop_point", [
+            {"id": "SB", "name": "On the pattern"},
+            {"id": "SC", "name": "Called at, but off the pattern"},
+        ])
+        db.upsert("journey_pattern", [{"id": "JPB", "line_id": "LB"}])
+        db.upsert("point_in_journey_pattern", [
+            {"journey_pattern_id": "JPB", "stop_point_id": "SB", "order": 0},
+        ])
+        db.upsert("service_journey", [
+            {"id": "JB", "line_id": "LB", "journey_pattern_id": "JPB",
+             "day_type_id": "WD", "departure_time": "08:00:00"},
+        ])
+        db.upsert("passing_time", [
+            {"service_journey_id": "JB", "stop_point_id": "SB", "order": 0},
+            {"service_journey_id": "JB", "stop_point_id": "SC", "order": 1},
+        ])
+        assert db.transport_modes_by_stop_point() == {"SB": "bus"}
+
+    def test_the_pattern_answers_for_a_stop_the_calls_also_reach(self, db):
+        """A mixed feed: the pattern's answer is the stronger statement.
+
+        The two paths must not be able to outvote each other, so the call path
+        fills gaps only -- here the tram pattern wins its stop against three
+        bus journeys that carry no pattern and call there too.
+        """
+        self._pattern_less_feed(db)
+        db.upsert("scheduled_stop_point", [{"id": "S", "name": "Interchange"}])
+        db.upsert("journey_pattern", [{"id": "JPT", "line_id": "LT"}])
+        db.upsert("point_in_journey_pattern", [
+            {"journey_pattern_id": "JPT", "stop_point_id": "S", "order": 0},
+        ])
+        db.upsert("service_journey", [
+            {"id": "JT", "line_id": "LT", "journey_pattern_id": "JPT",
+             "day_type_id": "WD", "departure_time": "07:00:00"},
+        ] + [
+            {"id": f"JB{i}", "line_id": "LB", "day_type_id": "WD",
+             "departure_time": f"0{i}:00:00"} for i in range(1, 4)
+        ])
+        db.upsert("passing_time", [
+            {"service_journey_id": "JT", "stop_point_id": "S", "order": 0},
+        ] + [
+            {"service_journey_id": f"JB{i}", "stop_point_id": "S", "order": 0}
+            for i in range(1, 4)
+        ])
+        assert db.transport_modes_by_stop_point() == {"S": "tram"}
