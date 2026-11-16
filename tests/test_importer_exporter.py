@@ -111,6 +111,63 @@ class TestGtfsExporter:
         assert len(stops_lines) == 3   # header + 2 records
 
 
+class TestCalendarWrittenOnlyWhenItSaysSomething:
+    """A service running on no weekday is described by its exception dates alone.
+
+    GTFS makes calendar.txt conditionally required precisely so a feed can be
+    written this way, and the Porto feed is: no calendar.txt at all, every
+    service in calendar_dates.txt. Writing an all-false row back is an
+    addition, not fidelity, and the MobilityData validator charges four
+    warnings for the three rows -- which is the whole of the 5 603-against-5 599
+    gap the paper reports.
+    """
+
+    @staticmethod
+    def _seed(db, week, dates=(("20260105", True),)):
+        db.upsert("operator", [{"id": "OP", "name": "Op", "timezone": "UTC"}])
+        db.upsert("day_type", [dict(zip(
+            ("monday", "tuesday", "wednesday", "thursday",
+             "friday", "saturday", "sunday"), week),
+            id="S", start_date="20260101", end_date="20261231")])
+        if dates:
+            db.upsert("operating_day_exception", [
+                {"day_type_id": "S", "date": d, "is_addition": add}
+                for d, add in dates])
+
+    @staticmethod
+    def _names(db, tmp_path, name="out.zip"):
+        out = tmp_path / name
+        GtfsExporter().export_from_db(db, out)
+        with zipfile.ZipFile(out) as zf:
+            return set(zf.namelist()), {n: zf.read(n).decode() for n in zf.namelist()}
+
+    def test_an_all_false_service_with_added_dates_writes_no_calendar_row(
+            self, db, tmp_path):
+        self._seed(db, (False,) * 7)
+        names, content = self._names(db, tmp_path)
+        assert "calendar.txt" not in names, (
+            "the row carries nothing calendar_dates.txt does not already say")
+        assert "calendar_dates.txt" in names
+        assert "20260105" in content["calendar_dates.txt"]
+
+    def test_an_all_false_service_with_no_added_date_keeps_its_row(
+            self, db, tmp_path):
+        # It runs never, and the row is the only place that says so. Removing
+        # it would drop the service from the feed entirely.
+        self._seed(db, (False,) * 7, dates=(("20260105", False),))
+        names, content = self._names(db, tmp_path)
+        assert "calendar.txt" in names
+        assert "S" in content["calendar.txt"]
+
+    def test_a_service_with_one_active_weekday_keeps_its_row(self, db, tmp_path):
+        # The narrow rule must not reach a service whose weekdays mean
+        # something, however many exceptions it also carries.
+        self._seed(db, (True,) + (False,) * 6)
+        names, content = self._names(db, tmp_path)
+        assert "calendar.txt" in names
+        assert "S" in content["calendar.txt"]
+
+
 class TestRoundTrip:
     def test_import_export_preserves_counts(self, db, minimal_gtfs_records, tmp_path):
         zip_path = tmp_path / "input.zip"

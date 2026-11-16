@@ -176,10 +176,48 @@ class GtfsExporter:
                 }, pw))
             write_csv("pathways.txt", pathways)
 
+            # 5. calendar_dates.txt -- read before calendar.txt, which needs to
+            # know which services their exception dates already describe.
+            exceptions = db.get_records("operating_day_exception")
+            cal_dates = []
+            added_on_some_date = set()
+            for exc in exceptions:
+                if exc["is_addition"]:
+                    added_on_some_date.add(exc["day_type_id"])
+                cal_dates.append(_apply_extras({
+                    "service_id": exc["day_type_id"],
+                    "date": exc["date"],
+                    "exception_type": 1 if exc["is_addition"] else 2
+                }, exc))
+            write_csv("calendar_dates.txt", cal_dates)
+
             # 6. calendar.txt
+            #
+            # A service whose seven weekday flags are all false runs on no
+            # weekday: the dates it runs are exactly the ones calendar_dates.txt
+            # adds, and the row says nothing the exceptions do not already say.
+            # GTFS makes calendar.txt conditionally required for this reason --
+            # a feed may leave it out when calendar_dates.txt describes every
+            # service -- and the Porto feed does leave it out. Writing the row
+            # back is therefore not fidelity but an addition, and one the
+            # MobilityData validator flags: an all-false row is usually a
+            # mistake, so it raised service_has_no_active_day_of_the_week three
+            # times, and a fourth notice because a non-ASCII service_id then
+            # appeared in one more file. Four warnings, 5 603 against the
+            # original's 5 599, for three rows carrying no information.
+            #
+            # The rule is deliberately narrow: all seven false *and* at least
+            # one date added by an exception. An all-false service with no
+            # addition runs never, and its row is the only place that says so,
+            # so it is still written.
             day_types = db.get_records("day_type")
             calendars = []
             for dt in day_types:
+                week = (dt["monday"], dt["tuesday"], dt["wednesday"],
+                        dt["thursday"], dt["friday"], dt["saturday"],
+                        dt["sunday"])
+                if not any(week) and dt["id"] in added_on_some_date:
+                    continue
                 calendars.append(_apply_extras({
                     "service_id": dt["id"],
                     "monday": dt["monday"],
@@ -193,17 +231,6 @@ class GtfsExporter:
                     "end_date": dt["end_date"]
                 }, dt))
             write_csv("calendar.txt", calendars)
-
-            # 5. calendar_dates.txt
-            exceptions = db.get_records("operating_day_exception")
-            cal_dates = []
-            for exc in exceptions:
-                cal_dates.append(_apply_extras({
-                    "service_id": exc["day_type_id"],
-                    "date": exc["date"],
-                    "exception_type": 1 if exc["is_addition"] else 2
-                }, exc))
-            write_csv("calendar_dates.txt", cal_dates)
 
             # 6. trips.txt
             service_journeys = db.get_records("service_journey")
