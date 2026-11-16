@@ -464,6 +464,10 @@ class NetexExporter:
         # groups later.
         if feed_info and profile.carries("feed_info"):
             self._write_data_sources(frame, feed_info)
+        # typesOfValue sits between them: the CEN ResourceFrameGroup runs
+        # DataManagementInFrameGroup -> TypeOfValueInFrameGroup ->
+        # OrganisationInFrameGroup.
+        profile.write_types_of_frame(frame)
         organisations = profile.container(frame, "organisations")
 
         for op in operators:

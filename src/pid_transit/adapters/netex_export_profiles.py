@@ -434,6 +434,37 @@ class ExportProfile:
                 ET.SubElement(frame, "TypeOfFrameRef",
                               attrib={"ref": ref, "version": self.frame_version})
 
+    def write_types_of_frame(self, frame: ET.Element) -> None:
+        """Declare the TypeOfFrame values this document's frames reference.
+
+        ``write_frame_header`` puts a ``TypeOfFrameRef`` on every frame, which
+        is what EPIP asks for. The CEN schema also carries an identity
+        constraint over them: ``TypeOfFrame_AnyKeyRef`` selects every
+        ``.//TypeOfFrameRef`` and refers to a key over ``.//TypeOfFrame``
+        ``@id`` + ``@version``. EPIP publishes its five frame types as external
+        reference data, so a document that references them without declaring
+        them is ordinary EPIP practice *and* invalid against the schema with
+        constraints enabled -- one error per reference, with nothing wrong with
+        the data. The same document validates with zero errors against
+        ``NeTEx_publication-NoConstraint.xsd``, which is how the CEN
+        distribution acknowledges the problem.
+
+        Declaring them locally costs one empty element each and makes the
+        document self-contained, so it validates either way. A profile that
+        writes no ``TypeOfFrameRef`` declares nothing, which is what keeps this
+        inert for the Portuguese profile rather than a flag it has to know
+        about.
+        """
+        if not self.write_type_of_frame:
+            return
+        refs = sorted(set(self.TYPE_OF_FRAME.values()))
+        if not refs:
+            return
+        container = self.container(frame, "typesOfValue")
+        for ref in refs:
+            ET.SubElement(container, "TypeOfFrame",
+                          attrib={"id": ref, "version": self.frame_version})
+
     def write_composite_frame_defaults(
             self, composite: ET.Element,
             timezone: Optional[str] = None,

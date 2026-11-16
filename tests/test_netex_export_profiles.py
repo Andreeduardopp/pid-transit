@@ -191,6 +191,48 @@ class TestEpipBaseline:
             "epip:EU_PI_TIMETABLE",
         ]
 
+    def test_every_type_of_frame_it_references_is_declared_in_the_document(
+            self, tmp_path):
+        """The CEN identity constraint, checked here instead of by a 7-minute XSD run.
+
+        `TypeOfFrame_AnyKeyRef` selects every `.//TypeOfFrameRef` and refers to
+        a key over `.//TypeOfFrame` `@id` + `@version`. EPIP publishes its five
+        frame types as external reference data, so writing the references
+        without the declarations is ordinary EPIP practice and still six schema
+        errors -- which is exactly what the Porto export produced once
+        TypeOfFrameRef was turned on: valid against
+        `NeTEx_publication-NoConstraint.xsd`, six errors against
+        `NeTEx_publication.xsd`, and nothing wrong with the data.
+
+        Asserting the pairing rather than the literal set is deliberate: adding
+        a sixth frame type to `TYPE_OF_FRAME` must not be able to reintroduce
+        the defect.
+        """
+        root, _ = _export(_seeded_db(), tmp_path)
+        referenced = {(el.attrib["ref"], el.attrib.get("version"))
+                      for el in _findall(root, ".//n:TypeOfFrameRef")}
+        declared = {(el.attrib["id"], el.attrib.get("version"))
+                    for el in _findall(root, ".//n:TypeOfFrame")}
+        assert referenced, "the baseline must reference its profile"
+        assert referenced <= declared, (
+            f"referenced but not declared: {sorted(referenced - declared)}")
+        # Nothing declared that nothing points at, either.
+        assert declared == referenced
+
+    def test_the_declarations_sit_where_the_resource_frame_group_puts_them(
+            self, tmp_path):
+        # CEN ResourceFrameGroup: DataManagementInFrameGroup (dataSources) ->
+        # TypeOfValueInFrameGroup (typesOfValue) -> OrganisationInFrameGroup.
+        # Out of order it is a schema error, and the writer appends rather than
+        # sorting here, so the order is the call order.
+        root, _ = _export(_seeded_db(), tmp_path)
+        frame = _find(root, "n:dataObjects/n:CompositeFrame/n:frames/n:ResourceFrame")
+        tags = _tags(frame)
+        assert "typesOfValue" in tags
+        if "dataSources" in tags:
+            assert tags.index("dataSources") < tags.index("typesOfValue")
+        assert tags.index("typesOfValue") < tags.index("organisations")
+
     def test_every_frame_states_the_window_it_is_valid_over(self, tmp_path):
         # Derived from the day types rather than invented; the exporter was
         # already computing it and dropping it on the floor.
@@ -369,6 +411,22 @@ class TestPortugueseProfileStructure:
         assert _find(arrival, "n:Time").text == "00:20:00"
         assert _find(arrival, "n:DayOffset").text == "1"
         assert _tags(arrival) == ["Time", "DayOffset", "ForAlighting"]
+
+
+class TestPortugueseProfileDeclaresNoFrameTypes:
+    def test_a_profile_that_references_none_declares_none(self, tmp_path):
+        """The inertness the declaration mechanism has to keep.
+
+        The PT profile switches `write_type_of_frame` off, so it writes no
+        `TypeOfFrameRef` -- and must therefore write no `typesOfValue` either.
+        A declaration nothing points at would be the base profile's answer
+        leaking into a profile that did not ask for it, which is the one thing
+        the subclass arrangement exists to prevent.
+        """
+        root, _ = _export(_seeded_db(), tmp_path, profile="pt", name="pt.xml")
+        assert _findall(root, ".//n:TypeOfFrameRef") == []
+        assert _findall(root, ".//n:TypeOfFrame") == []
+        assert _findall(root, ".//n:typesOfValue") == []
 
 
 class TestPortugueseProfileLosses:
