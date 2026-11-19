@@ -53,14 +53,24 @@ def find_pattern_violations(db: TransmodelDatabase) -> Set[str]:
 
 def build_pattern_dedup_map(
     db: TransmodelDatabase,
+    by_shape: bool = False,
 ) -> Tuple[Dict[str, str], Set[str]]:
     """Compute the §2 quotient over all journey patterns.
 
     Returns ``(remap, canonical_ids)`` where ``remap`` maps every pattern id to
     its class's canonical id and ``canonical_ids`` is the set of canonical ids.
+
+    ``by_shape`` adds the shape of a pattern's journeys to the signature. The
+    NeTEx exporter needs it: there a shape hangs on the pattern (through its
+    ServiceLinks), so merging two patterns that run the same stops over
+    different shapes would hand one journey the other's shape.
     """
     patterns = db.get_records("journey_pattern")
     points = db.get_records("point_in_journey_pattern")
+    shape_of: Dict[str, object] = {}
+    if by_shape:
+        for sj in db.get_records("service_journey"):
+            shape_of.setdefault(sj.get("journey_pattern_id"), sj.get("shape_id"))
 
     points_by_pattern: Dict[str, List[dict]] = {}
     for pt in points:
@@ -74,6 +84,8 @@ def build_pattern_dedup_map(
         pts = sorted(points_by_pattern.get(jp_id, []), key=lambda p: p["order"])
         stop_sig = tuple(p["stop_point_id"] for p in pts)
         sig = (jp.get("line_id"), jp.get("direction"), stop_sig)
+        if by_shape:
+            sig = sig + (shape_of.get(jp_id),)
 
         if sig not in sig_to_canonical:
             sig_to_canonical[sig] = jp_id

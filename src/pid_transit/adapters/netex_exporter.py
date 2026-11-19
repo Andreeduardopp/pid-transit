@@ -322,11 +322,13 @@ class NetexExporter:
         """Build a mapping from original JP ids to canonical JP ids.
 
         Groups patterns by (line_id, direction, ordered stop sequence) — the §2
-        quotient shared with ``TransitDataset.normalize_patterns()``.
+        quotient shared with ``TransitDataset.normalize_patterns()`` — and by
+        shape, because a NeTEx pattern carries one shape: two patterns over the
+        same stops but different shapes stay two patterns.
         Returns {original_id: canonical_id} and the set of canonical IDs.
         """
         from ..core.patterns import build_pattern_dedup_map
-        return build_pattern_dedup_map(db)
+        return build_pattern_dedup_map(db, by_shape=True)
 
     def export_from_db(self, db: TransmodelDatabase,
                        output_path: Union[Path, str]) -> Dict[str, int]:

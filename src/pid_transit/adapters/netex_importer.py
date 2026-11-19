@@ -1088,6 +1088,9 @@ class NetexImporter:
         # patterns that traverse exactly the same links share one shape, and
         # patterns that do not never collide, whatever the producer's id scheme.
         shape_by_links: Dict[tuple, str] = {}
+        # Rebuilt polyline of each shape id issued here, to recognise a later
+        # link sequence that is another cut of the same shape.
+        shape_coords: Dict[str, tuple] = {}
         # How many patterns still need each link, so its coordinates can be
         # dropped as soon as the last one has consumed them rather than held
         # until the whole feed is rebuilt.
@@ -1123,6 +1126,25 @@ class NetexImporter:
             # started with. Any other producer's ids fall back to the pattern.
             head = link_ids[0]
             shape_id = head.rsplit(":link:", 1)[0] if ":link:" in head else f"{jpid}:shape"
+
+            coords = list(segments[0])
+            for seg in segments[1:]:
+                coords.extend(seg[1:] if seg[0] == coords[-1] else seg)
+            coords_key = tuple(coords)
+
+            # The exporter cuts one shape once per stop sequence and names the
+            # second and later cuts "<shape>:v<n>". Every cut spans the whole
+            # polyline, so a variant whose geometry is that of its base shape
+            # is the base shape, and its journeys get the base id back.
+            base, sep, n = shape_id.rpartition(":v")
+            if sep and n.isdigit() and base and shape_coords.get(base) == coords_key:
+                shape_by_links[key] = base
+                state.jp_shape[jpid] = base
+                continue
+            if shape_id in state.shape_ids and shape_coords.get(shape_id) == coords_key:
+                shape_by_links[key] = shape_id
+                state.jp_shape[jpid] = shape_id
+                continue
             if shape_id in state.shape_ids:
                 # Taken by another link sequence, or by a legacy projection on
                 # this same pattern. Distinct geometry needs a distinct id.
@@ -1133,10 +1155,8 @@ class NetexImporter:
                     shape_id = f"{base}:{n}"
             shape_by_links[key] = shape_id
             state.jp_shape[jpid] = shape_id
+            shape_coords[shape_id] = coords_key
 
-            coords = list(segments[0])
-            for seg in segments[1:]:
-                coords.extend(seg[1:] if seg[0] == coords[-1] else seg)
             state.shape_points.extend(
                 {"shape_id": shape_id, "lat": lat, "lon": lon, "sequence": i}
                 for i, (lat, lon) in enumerate(coords)
