@@ -214,8 +214,8 @@ class Frequency(BaseModel):
 
 class Transfer(BaseModel):
     """Stop-to-stop transfer rule / GTFS 'transfers'."""
-    from_stop_id: str = Field(..., description="Reference to ScheduledStopPoint.id")
-    to_stop_id: str = Field(..., description="Reference to ScheduledStopPoint.id")
+    from_stop_id: str = Field(..., description="Reference to ScheduledStopPoint.id or StopArea.id")
+    to_stop_id: str = Field(..., description="Reference to ScheduledStopPoint.id or StopArea.id")
     transfer_type: int = Field(0, description="0=recommended, 1=timed, 2=min_time, 3=none")
     min_transfer_time: Optional[int] = Field(None, description="Minimum transfer time in seconds")
     extras: Optional[str] = Field(None, description="JSON object of unmapped source fields")

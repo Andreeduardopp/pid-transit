@@ -260,11 +260,21 @@ def validate_transmodel(
                     severity=Severity.INFO,
                 ))
 
-    # --- V13: Pathway references valid stops/stop_areas ---
+    # --- V13: Pathway and transfer ends reference valid stops/stop_areas ---
     try:
         pathway_records = db.get_records("pathway")
         stop_area_ids: Set[str] = {sa["id"] for sa in db.get_records("stop_area")}
         all_stop_ids = stop_ids | stop_area_ids
+        for tr in db.get_records("transfer"):
+            for field_name in ("from_stop_id", "to_stop_id"):
+                if tr[field_name] not in all_stop_ids:
+                    report._append(ValidationIssue(
+                        entity_type="transfer",
+                        entity_id=f"{tr['from_stop_id']}->{tr['to_stop_id']}",
+                        issue_type="orphan_stop_reference",
+                        message=(f"Transfer {tr['from_stop_id']} -> {tr['to_stop_id']} "
+                                 f"references non-existent stop {tr[field_name]}."),
+                    ))
         for pw in pathway_records:
             for field_name in ("from_stop_id", "to_stop_id"):
                 if pw[field_name] not in all_stop_ids:

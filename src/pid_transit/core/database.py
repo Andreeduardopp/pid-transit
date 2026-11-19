@@ -16,7 +16,7 @@ from .schemas import TRANSMODEL_ENTITIES
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "3.2.0-transmodel"
+SCHEMA_VERSION = "3.3.0-transmodel"
 
 _TABLE_SCHEMAS = {
     "operator": """
@@ -209,8 +209,11 @@ _TABLE_SCHEMAS = {
     """,
     "transfer": """
         CREATE TABLE IF NOT EXISTS transfer (
-            from_stop_id      TEXT NOT NULL REFERENCES scheduled_stop_point(id),
-            to_stop_id        TEXT NOT NULL REFERENCES scheduled_stop_point(id),
+            -- An end is a scheduled stop point or a stop area: GTFS lets
+            -- transfers.txt name a station. Like pathway, no foreign key;
+            -- the validator (V13) checks that each end exists in one of them.
+            from_stop_id      TEXT NOT NULL,
+            to_stop_id        TEXT NOT NULL,
             transfer_type     INTEGER NOT NULL DEFAULT 0,
             min_transfer_time INTEGER,
             extras            TEXT,
@@ -453,6 +456,7 @@ class TransmodelDatabase:
                 )
                 if stored_version == "3.0.0-transmodel":
                     self._migrate_nullable_stop_coords(conn)
+                self._migrate_transfer_without_fk(conn)
                 for ddl in _TABLE_SCHEMAS.values():
                     conn.execute(ddl)
                 self._migrate_add_missing_columns(conn)
@@ -483,6 +487,30 @@ class TransmodelDatabase:
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             if "extras" not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN extras TEXT")
+
+    @staticmethod
+    def _migrate_transfer_without_fk(conn: sqlite3.Connection) -> None:
+        """3.2 -> 3.3: a transfer end may be a station (a stop area), so the
+        foreign keys to scheduled_stop_point go. SQLite cannot drop a foreign
+        key in place, so rebuild the table. A no-op when the table is absent
+        or already has no foreign key."""
+        if not conn.execute("PRAGMA foreign_key_list(transfer)").fetchall():
+            return
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("ALTER TABLE transfer RENAME TO _transfer_migrate_old")
+            conn.execute(_TABLE_SCHEMAS["transfer"])
+            cols = [r[1] for r in conn.execute(
+                "PRAGMA table_info(_transfer_migrate_old)")]
+            keep = ", ".join(c for c in cols
+                             if c in {"from_stop_id", "to_stop_id", "transfer_type",
+                                      "min_transfer_time", "extras"})
+            conn.execute(f"INSERT INTO transfer ({keep}) "
+                         f"SELECT {keep} FROM _transfer_migrate_old")
+            conn.execute("DROP TABLE _transfer_migrate_old")
+            conn.commit()
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _migrate_nullable_stop_coords(conn: sqlite3.Connection) -> None:

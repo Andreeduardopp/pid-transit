@@ -879,6 +879,15 @@ class NetexExporter:
             profile.note_unsupported("transfer", len(transfers))
             transfers = []
         if transfers:
+            # A Connection joins two ScheduledStopPoints. A GTFS transfer may
+            # name a station, which this exporter does not write as a stop
+            # point, so such a transfer has nothing to reference.
+            point_ids = {r["id"] for r in db.get_records("scheduled_stop_point")}
+            kept = [t for t in transfers
+                    if t["from_stop_id"] in point_ids and t["to_stop_id"] in point_ids]
+            profile.note_unsupported("transfer_station_end", len(transfers) - len(kept))
+            transfers = kept
+        if transfers:
             connections = profile.container(frame, "connections")
             for i, tr in enumerate(transfers, 1):
                 conn = ET.SubElement(
