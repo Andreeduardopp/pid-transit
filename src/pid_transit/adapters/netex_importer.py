@@ -259,6 +259,10 @@ class _RunState:
         # different files, so both are buffered and joined at flush time.
         self.link_geometry: Dict[str, List[tuple]] = {}   # link id -> [(lat, lon), ...]
         self.jp_links: Dict[str, List[str]] = {}          # pattern id -> ordered link ids
+        # Direction id -> DirectionType, and pattern id -> DirectionRef: the
+        # EPIP pattern names its direction by reference only.
+        self.directions: Dict[str, str] = {}
+        self.jp_direction_ref: Dict[str, str] = {}
         # The document's own locale, from CompositeFrame/FrameDefaults. A NeTEx
         # time is a local time and this is the only place the file says which
         # local, so it is read before any operator is written and applied to all
@@ -918,6 +922,12 @@ class NetexImporter:
                 "min_transfer_time": duration,
             })
 
+        def on_direction(d: ET.Element) -> None:
+            did = d.attrib.get("id")
+            value = _text(d.find("n:DirectionType", self._ns))
+            if did and value:
+                state.directions[did] = value
+
         def on_service_link(link: ET.Element) -> None:
             """A hop's geometry, in either form the CEN LinkGroup allows.
 
@@ -946,7 +956,15 @@ class NetexImporter:
             if not jpid:
                 return
             direction = _text(jp.find("n:DirectionType", self._ns))
+            if direction is None:
+                dref = jp.find("n:DirectionRef", self._ns)
+                if dref is not None and dref.attrib.get("ref"):
+                    state.jp_direction_ref[jpid] = dref.attrib["ref"]
             route_ref_el = jp.find("n:RouteRef", self._ns)
+            if route_ref_el is None:
+                # RouteView/LineRef: the pattern names its line directly. The
+                # flush below accepts a line id where a route id is expected.
+                route_ref_el = jp.find("n:RouteView/n:LineRef", self._ns)
             route_ref = route_ref_el.attrib.get("ref") if route_ref_el is not None else None
 
             # Preferred form: geometry lives on ServiceLinks and the pattern
@@ -990,6 +1008,7 @@ class NetexImporter:
                         except ValueError:
                             logger.warning("Invalid gml:posList on pattern %s", jpid)
             points = []
+            onward = []
             seq = jp.find("n:pointsInSequence", self._ns)
             if seq is not None:
                 for spi in seq.findall("n:StopPointInJourneyPattern", self._ns):
@@ -1000,6 +1019,15 @@ class NetexImporter:
                             spi.attrib.get("id"),
                             ssp_ref.attrib.get("ref"),
                         ))
+                        link_ref = spi.find("n:OnwardServiceLinkRef", self._ns)
+                        if link_ref is not None and link_ref.attrib.get("ref"):
+                            onward.append((int(spi.attrib.get("order", 0)),
+                                           link_ref.attrib["ref"]))
+            if jpid not in state.jp_links and onward and len(onward) == len(points) - 1:
+                # The EPIP form of linksInSequence: each stop names the link
+                # to the next one. Only a complete chain is a shape.
+                onward.sort(key=lambda t: t[0])
+                state.jp_links[jpid] = [ref for _o, ref in onward]
             state.patterns[jpid] = (direction, route_ref, points)
 
         def on_service_journey(sj: ET.Element) -> None:
@@ -1086,6 +1114,7 @@ class NetexImporter:
             "JourneyPattern": on_pattern,
             # Subtypes used by production feeds (e.g. the Swiss profile).
             "ServiceJourneyPattern": on_pattern,
+            "Direction": on_direction,
             "ServiceJourney": on_service_journey,
             "TemplateServiceJourney": on_service_journey,
         }
@@ -1332,6 +1361,8 @@ class NetexImporter:
         patterns = []
         points = []
         for jpid, (direction, route_ref, spi_points) in state.patterns.items():
+            if direction is None and jpid in state.jp_direction_ref:
+                direction = state.directions.get(state.jp_direction_ref[jpid])
             # A pattern's RouteRef names a Route, which in turn names the Line;
             # minimal feeds (and our own exporter) may reference the Line
             # directly. Fall back to the line seen on this pattern's journeys.
@@ -1571,7 +1602,7 @@ class _Pass2:
         "MobilityImpairedAccess", "TimetabledPassingTime",
         "StopPointInJourneyPatternRef", "ArrivalTime", "ArrivalDayOffset",
         "Call", "ScheduledStopPointRef", "Arrival", "Departure", "Time",
-        "DayOffset", "JourneyPatternView",
+        "DayOffset", "JourneyPatternView", "keyList", "KeyValue", "Key", "Value",
     )
 
     def handlers(self) -> Dict[str, callable]:
@@ -1697,6 +1728,23 @@ class _Pass2:
             elif tag == Q["frequencyGroups"]:
                 if freq_groups is None:
                     freq_groups = child
+            elif tag == Q["keyList"]:
+                # The EPIP journey has no AccessibilityAssessment; our exporter
+                # keeps the GTFS flag here instead.
+                for kv in child:
+                    if kv.tag != Q["KeyValue"]:
+                        continue
+                    key = value = None
+                    for part in kv:
+                        if part.tag == Q["Key"]:
+                            key = _text(part)
+                        elif part.tag == Q["Value"]:
+                            value = _text(part)
+                    if key == "gtfs_wheelchair_accessible" and value is not None:
+                        try:
+                            wheelchair = int(value)
+                        except ValueError:
+                            pass
             elif tag == Q["AccessibilityAssessment"]:
                 if wheelchair is None:
                     for r in child:

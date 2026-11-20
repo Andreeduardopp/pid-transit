@@ -222,7 +222,7 @@ class _StationLayout:
 # frame's own EntityInVersion/VersionFrame groups and precede all of it.
 _SERVICE_FRAME_ORDER = (
     "ValidBetween", "TypeOfFrameRef", "Name",
-    "Network", "routes", "lines", "groupsOfLines", "destinationDisplays",
+    "Network", "directions", "routes", "lines", "groupsOfLines", "destinationDisplays",
     "scheduledStopPoints", "serviceLinks", "connections",
     "stopAssignments", "journeyPatterns", "notices", "noticeAssignments",
 )
@@ -509,6 +509,7 @@ class NetexExporter:
         distinct = set(self._stop_modes.values())
         self._default_stop_mode = distinct.pop() if len(distinct) == 1 else None
         self._stop_types: Dict[str, str] = {}
+        self._stop_place_of: Dict[str, str] = {}
         # Patterns the document cannot state a stop sequence for; filled by the
         # ServiceFrame writer and read by the TimetableFrame writer, which must
         # not then reference points that were never written.
@@ -615,15 +616,20 @@ class NetexExporter:
             ET.SubElement(el, "Name").text = op["name"]
             url = op.get("url") if profile.states("operator", "url") else None
             phone = op.get("phone") if profile.states("operator", "phone") else None
-            if phone or url:
+            required = profile.operator_contact_and_type_required
+            if phone or url or required:
                 # CEN ContactDetailsStructure is a sequence: ContactPerson,
                 # Email, Phone, Fax, Url. Phone before Url, not the order the
-                # PT example happens to show (it has only Url).
+                # PT example happens to show (it has only Url). EPIP makes the
+                # element mandatory, so it is written empty when there is
+                # nothing to put in it.
                 contact = ET.SubElement(el, "ContactDetails")
                 if phone:
                     ET.SubElement(contact, "Phone").text = phone
                 if url:
                     ET.SubElement(contact, "Url").text = url
+            if required:
+                ET.SubElement(el, "OrganisationType").text = "operator"
 
     def _write_data_sources(self, frame: ET.Element, feed_info: list) -> None:
         """`feed_info` as a DataSource — who published this file, and for when.
@@ -687,6 +693,10 @@ class NetexExporter:
         layout = (_StationLayout(db, stops, profile)
                   if profile.writes_station_structure and profile.writes_quays
                   else None)
+        if layout is not None:
+            # The StopPlace a platform's Quay sits in, for the
+            # PassengerStopAssignment; a platform not listed is its own.
+            self._stop_place_of = dict(layout.platform_station)
 
         # Stations first: each one a StopPlace holding its platforms as Quays.
         if layout is not None:
@@ -994,6 +1004,9 @@ class NetexExporter:
                                 "order": str(order)})
                     ET.SubElement(psa, "ScheduledStopPointRef",
                                   attrib=profile.ref_attrs(sp["id"]))
+                    if profile.assignment_writes_stop_place_ref:
+                        ET.SubElement(psa, "StopPlaceRef", attrib=profile.ref_attrs(
+                            self._stop_place_of.get(sp["id"], sp["id"])))
                     ET.SubElement(psa, "QuayRef",
                                   attrib=profile.ref_attrs(f"{sp['id']}:Quay"))
 
@@ -1110,11 +1123,16 @@ class NetexExporter:
                         link = ET.SubElement(links_el, "ServiceLink", attrib={
                             "id": link_id, "version": "1"
                         })
-                        projections = ET.SubElement(link, "projections")
-                        proj = ET.SubElement(projections, "LinkSequenceProjection", attrib={
-                            "id": f"{link_id}:proj", "version": "1"
-                        })
-                        line_string = ET.SubElement(proj, "gml:LineString", attrib={
+                        if profile.service_link_projection:
+                            projections = ET.SubElement(link, "projections")
+                            host = ET.SubElement(projections, "LinkSequenceProjection", attrib={
+                                "id": f"{link_id}:proj", "version": "1"
+                            })
+                        else:
+                            # The LinkGroup's own gml:LineString, which CEN
+                            # also admits and EPIP admits alone.
+                            host = link
+                        line_string = ET.SubElement(host, "gml:LineString", attrib={
                             "gml:id": f"ls_{gml_seq}"
                         })
                         ET.SubElement(line_string, "gml:posList").text = " ".join(
@@ -1127,13 +1145,30 @@ class NetexExporter:
                             "ref": to_stop, "version": "1"
                         })
 
+            states_direction = profile.states("journey_pattern", "direction")
+            if profile.pattern_direction_as_ref and states_direction:
+                values = sorted({jp["direction"] for jp in patterns if jp.get("direction")})
+                if values:
+                    directions_el = ET.SubElement(frame, "directions")
+                    for value in values:
+                        d = ET.SubElement(directions_el, "Direction", attrib=profile.entity_attrs(
+                            profile.object_id("Direction", value)))
+                        ET.SubElement(d, "DirectionType").text = value
+
             patterns_el = ET.SubElement(frame, "journeyPatterns")
             for jp in patterns:
-                el = ET.SubElement(patterns_el, "JourneyPattern", attrib={
+                el = ET.SubElement(patterns_el, profile.journey_pattern_element, attrib={
                     "id": jp["id"], "version": "1"
                 })
-                if jp.get("direction") and profile.states("journey_pattern", "direction"):
-                    ET.SubElement(el, "DirectionType").text = jp["direction"]
+                if profile.pattern_line_as_route_view:
+                    view = ET.SubElement(el, "RouteView")
+                    ET.SubElement(view, "LineRef", attrib=profile.ref_attrs(jp["line_id"]))
+                if jp.get("direction") and states_direction:
+                    if profile.pattern_direction_as_ref:
+                        ET.SubElement(el, "DirectionRef", attrib=profile.ref_attrs(
+                            profile.object_id("Direction", jp["direction"])))
+                    else:
+                        ET.SubElement(el, "DirectionType").text = jp["direction"]
 
                 pattern_pts = points_by_pattern.get(jp["id"], [])
                 if len(pattern_pts) == 1:
@@ -1148,9 +1183,16 @@ class NetexExporter:
                     profile.note_dropped("point_in_journey_pattern_single",
                                          len(pattern_pts))
                     pattern_pts = []
+                links_key = pattern_links.get(jp["id"])
+                pattern_link_ids = ([link_id for link_id, _f, _t, _p in shape_links[links_key]]
+                                    if links_key else [])
+                onward = (pattern_link_ids if profile.pattern_links_as_onward_refs
+                          and len(pattern_link_ids) == len(pattern_pts) - 1 else [])
+                if pattern_link_ids and profile.pattern_links_as_onward_refs and not onward:
+                    profile.note_dropped("journey_pattern_shape_link_count")
                 if pattern_pts:
                     seq_el = ET.SubElement(el, "pointsInSequence")
-                    for pt in pattern_pts:
+                    for k, pt in enumerate(pattern_pts):
                         spi_id = f"{jp['id']}_stop_{pt['order']}"
                         spi = ET.SubElement(seq_el, "StopPointInJourneyPattern", attrib={
                             "id": spi_id,
@@ -1160,9 +1202,13 @@ class NetexExporter:
                         ET.SubElement(spi, "ScheduledStopPointRef", attrib={
                             "ref": pt["stop_point_id"], "version": "1"
                         })
+                        if k < len(onward):
+                            # The hop from this stop to the next: the EPIP way
+                            # of naming a pattern's links in order.
+                            ET.SubElement(spi, "OnwardServiceLinkRef",
+                                          attrib=profile.ref_attrs(onward[k]))
 
-                links_key = pattern_links.get(jp["id"])
-                if links_key:
+                if links_key and not profile.pattern_links_as_onward_refs:
                     links_seq = ET.SubElement(el, "linksInSequence")
                     for order, (link_id, _f, _t, _p) in enumerate(
                             shape_links[links_key], start=1):
@@ -1259,7 +1305,18 @@ class NetexExporter:
         frame = ET.SubElement(frames, "ServiceCalendarFrame",
                               attrib=profile.frame_attrs("ServiceCalendarFrame"))
         profile.write_frame_header(frame, "ServiceCalendarFrame", self._validity)
-        dt_container = profile.container(frame, "dayTypes")
+        host = frame
+        if profile.calendar_in_service_calendar:
+            # One ServiceCalendar holding the day types and their exceptions,
+            # spanning the feed's window -- the only content EPIP's
+            # ServiceCalendarFrame admits.
+            host = ET.SubElement(frame, "ServiceCalendar",
+                                 attrib=profile.calendar_entity_attrs(
+                                     profile.object_id("ServiceCalendar", 1)))
+            if self._validity:
+                ET.SubElement(host, "FromDate").text = self._validity[0]
+                ET.SubElement(host, "ToDate").text = self._validity[1]
+        dt_container = profile.container(host, "dayTypes")
         for dt in day_types:
             el = ET.SubElement(dt_container, "DayType",
                                attrib=profile.entity_attrs(dt["id"]))
@@ -1269,7 +1326,7 @@ class NetexExporter:
             self._write_days_of_week(el, dt)
 
         if exceptions:
-            assignments = profile.container(frame, "dayTypeAssignments")
+            assignments = profile.container(host, "dayTypeAssignments")
             for i, exc in enumerate(exceptions, 1):
                 a = ET.SubElement(
                     assignments, "DayTypeAssignment",
@@ -1431,11 +1488,15 @@ class NetexExporter:
                     self._write_calls(el, pt_by_journey.get(sj["id"], []))
                     continue
 
-                _write_accessibility(
-                    el, sj["id"],
-                    sj.get("wheelchair_accessible")
-                    if profile.states("service_journey", "wheelchair_accessible")
-                    else None)
+                wheelchair = (sj.get("wheelchair_accessible")
+                              if profile.states("service_journey", "wheelchair_accessible")
+                              else None)
+                if profile.journey_accessibility_in_key_list:
+                    if wheelchair is not None:
+                        _write_key_values(
+                            el, {"gtfs_wheelchair_accessible": str(int(wheelchair))})
+                else:
+                    _write_accessibility(el, sj["id"], wheelchair)
                 dep_time, dep_offset = _normalize_time(sj["departure_time"])
                 ET.SubElement(el, "DepartureTime").text = dep_time
                 if dep_offset:
@@ -1444,10 +1505,14 @@ class NetexExporter:
                 ET.SubElement(day_types_el, "DayTypeRef",
                               attrib=profile.ref_attrs(sj["day_type_id"]))
                 if jp_id:
-                    ET.SubElement(el, "JourneyPatternRef",
+                    ET.SubElement(el, profile.journey_pattern_element + "Ref",
                                   attrib=profile.ref_attrs(jp_id))
-                ET.SubElement(el, "LineRef",
-                              attrib=profile.ref_attrs(sj["line_id"]))
+                if profile.journey_writes_line_ref:
+                    ET.SubElement(el, "LineRef",
+                                  attrib=profile.ref_attrs(sj["line_id"]))
+                elif not jp_id:
+                    # The line is stated only through the pattern's RouteView.
+                    profile.note_dropped("service_journey_line_no_pattern")
 
                 sj_pts = pt_by_journey.get(sj["id"], [])
                 if sj_pts:

@@ -45,13 +45,19 @@ def _export_root(db, tmp_path, name="feed.xml"):
 
 
 def _links_of(root, jp_id):
-    """The ServiceLink ids a JourneyPattern references, in order."""
-    for jp in root.iter(f"{{{NS['n']}}}JourneyPattern"):
-        if jp.attrib.get("id") != jp_id:
-            continue
-        return [r.attrib["ref"]
-                for r in jp.findall("n:linksInSequence/n:ServiceLinkInJourneyPattern"
-                                    "/n:ServiceLinkRef", NS)]
+    """The ServiceLink ids a pattern references, in order: either form."""
+    for tag in ("JourneyPattern", "ServiceJourneyPattern"):
+        for jp in root.iter(f"{{{NS['n']}}}{tag}"):
+            if jp.attrib.get("id") != jp_id:
+                continue
+            refs = [r.attrib["ref"]
+                    for r in jp.findall("n:linksInSequence/n:ServiceLinkInJourneyPattern"
+                                        "/n:ServiceLinkRef", NS)]
+            # EPIP: each stop names the link to the next one.
+            refs += [r.attrib["ref"]
+                     for r in jp.findall("n:pointsInSequence/n:StopPointInJourneyPattern"
+                                         "/n:OnwardServiceLinkRef", NS)]
+            return refs
     return []
 
 
@@ -169,7 +175,7 @@ class TestCoarseShapes:
         root = _export_root(coarse, tmp_path)
         assert not list(root.iter(f"{{{NS['n']}}}ServiceLink"))
         assert _links_of(root, "JPA") == []
-        assert [jp.attrib["id"] for jp in root.iter(f"{{{NS['n']}}}JourneyPattern")] == ["JPA"]
+        assert [jp.attrib["id"] for jp in root.iter(f"{{{NS['n']}}}ServiceJourneyPattern")] == ["JPA"]
 
     def test_the_drop_is_logged(self, coarse, tmp_path, caplog):
         with caplog.at_level(logging.WARNING, logger="pid_transit.adapters.netex_exporter"):
@@ -242,7 +248,7 @@ class TestSchemaOrder:
         frame = next(root.iter(f"{{{NS['n']}}}ServiceFrame"))
         tags = [el.tag.rpartition("}")[2] for el in frame]
         assert tags == sorted(tags, key=[
-            "ValidBetween", "TypeOfFrameRef", "Name", "lines",
+            "ValidBetween", "TypeOfFrameRef", "Name", "directions", "lines",
             "scheduledStopPoints", "serviceLinks", "connections",
             "stopAssignments", "journeyPatterns",
         ].index)

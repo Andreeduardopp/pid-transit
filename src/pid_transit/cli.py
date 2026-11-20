@@ -485,10 +485,11 @@ def main():
     p_export.add_argument("--no-shapes", action="store_true",
                           help="Exclude shapes.txt from GTFS export (included by default)")
     p_export.add_argument("--profile", default="epip",
-                          choices=["epip", "pt"],
+                          choices=["epip", "epip-stations", "pt"],
                           help="NeTEx profile to write (netex only): 'epip' "
-                               "(default) or 'pt' for the Portuguese national "
-                               "profile")
+                               "(default), 'epip-stations' to also write the "
+                               "station structure, or 'pt' for the Portuguese "
+                               "national profile")
     p_export.add_argument("--no-dedup", action="store_true",
                           help="Disable journey pattern deduplication in NeTEx")
     p_export.add_argument("--compress", action="store_true",
@@ -520,9 +521,10 @@ def main():
                            choices=[p.value for p in NetexProfile],
                            help="Force a NeTEx dialect for reading instead of "
                                 "detecting one from the document's shape")
-    p_convert.add_argument("--profile", default=None, choices=["epip", "pt"],
+    p_convert.add_argument("--profile", default=None,
+                           choices=["epip", "epip-stations", "pt"],
                            help="NeTEx profile to write (netex output only): "
-                                "'epip' (default) or 'pt'")
+                                "'epip' (default), 'epip-stations' or 'pt'")
     p_convert.add_argument("--no-shapes", action="store_true",
                            help="Exclude shapes.txt from a GTFS output")
     p_convert.add_argument("--no-dedup", action="store_true",

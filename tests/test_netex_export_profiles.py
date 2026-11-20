@@ -260,21 +260,40 @@ class TestEpipBaseline:
         # Not `== {}` any more, and that is the correction rather than a
         # regression: EPIP has no slot for a GTFS route_sort_order and none for
         # per-stop-time boarding permissions, and it used to say so nowhere.
+        # The EPIP DataSource is Name, Description and Email, so the feed's
+        # validity, version and URLs are counted too.
         _, losses = _export(_seeded_db(), tmp_path)
         assert losses == {
             "unsupported_field_line_sort_order": 1,
             "unsupported_field_passing_time_pickup_type": 1,
+            "unsupported_field_feed_info_contact_url": 1,
+            "unsupported_field_feed_info_end_date": 1,
+            "unsupported_field_feed_info_publisher_url": 1,
+            "unsupported_field_feed_info_start_date": 1,
+            "unsupported_field_feed_info_version": 1,
         }
 
-    def test_the_base_profile_is_the_epip_one(self):
-        # EpipProfile is deliberately empty. If it ever stops being empty, this
-        # says so, because the base class is what every other profile inherits
-        # and a decision that belongs to EPIP alone must not sit there.
+    def test_epip_differs_from_the_base_only_where_its_xsd_does(self):
+        # EpipProfile was empty until the EPIP XSD showed that it narrows the
+        # CEN forms the base writes. Every difference is one of those
+        # narrowings; anything else here would be an EPIP decision leaking
+        # into what the other profiles inherit, or the reverse.
         base, epip = ExportProfile(), EpipProfile()
-        for attr in vars(ExportProfile):
-            if attr.startswith("_") or callable(getattr(base, attr, None)):
-                continue
-            assert getattr(epip, attr) == getattr(base, attr)
+        differing = {
+            attr for attr in vars(ExportProfile)
+            if not attr.startswith("_")
+            and not callable(getattr(base, attr, None))
+            and getattr(epip, attr) != getattr(base, attr)
+        }
+        assert differing == {
+            "writes_station_structure", "writes_stop_point_location",
+            "journey_pattern_element", "pattern_line_as_route_view",
+            "pattern_direction_as_ref", "pattern_links_as_onward_refs",
+            "journey_writes_line_ref", "journey_accessibility_in_key_list",
+            "service_link_projection", "assignment_writes_stop_place_ref",
+            "operator_contact_and_type_required", "calendar_in_service_calendar",
+            "WRITTEN_FIELDS",
+        }
 
 
 class TestPortugueseProfileStructure:
@@ -607,7 +626,6 @@ class TestWrittenFieldsIsOneDeclaration:
     CASES = [
         ("operator", "phone", "n:organisations/n:Operator/n:ContactDetails/n:Phone"),
         ("operator", "url", "n:organisations/n:Operator/n:ContactDetails/n:Url"),
-        ("feed_info", "publisher_url", "n:dataSources/n:DataSource/n:Url"),
         ("feed_info", "contact_email", "n:dataSources/n:DataSource/n:Email"),
         ("scheduled_stop_point", "wheelchair_boarding",
          "n:stopPlaces/n:StopPlace/n:AccessibilityAssessment"),
@@ -616,11 +634,11 @@ class TestWrittenFieldsIsOneDeclaration:
         ("line", "description", "n:lines/n:Line/n:Description"),
         ("line", "url", "n:lines/n:Line/n:Url"),
         ("journey_pattern", "direction",
-         "n:journeyPatterns/n:JourneyPattern/n:DirectionType"),
+         "n:journeyPatterns/n:ServiceJourneyPattern/n:DirectionRef"),
         ("transfer", "min_transfer_time",
          "n:connections/n:Connection/n:WalkTransferDuration"),
         ("service_journey", "wheelchair_accessible",
-         "n:vehicleJourneys/n:ServiceJourney/n:AccessibilityAssessment"),
+         "n:vehicleJourneys/n:ServiceJourney/n:keyList"),
     ]
 
     @pytest.mark.parametrize("entity,field,path", CASES)

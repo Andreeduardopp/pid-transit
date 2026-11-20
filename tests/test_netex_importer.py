@@ -714,13 +714,34 @@ class TestShapeGeometryOnServiceLinks:
         _db, _path, xml = exported
         jp_block = xml.split("<journeyPatterns>")[1].split("</journeyPatterns>")[0]
         assert "<projections>" not in jp_block
-        assert "<linksInSequence>" in jp_block
+        # EPIP names a pattern's links from its stops, one onward link each.
+        assert "<linksInSequence>" not in jp_block
+        assert jp_block.count("<OnwardServiceLinkRef ") == 3
 
     def test_one_service_link_per_hop(self, exported):
         _db, _path, xml = exported
         assert xml.count("<ServiceLink ") == 3          # 4 stops -> 3 hops
+        # The geometry sits on the link itself: the only form EPIP admits.
+        assert xml.count("<LinkSequenceProjection ") == 0
+        assert xml.count("<gml:LineString ") == 3
+
+    def test_the_cen_form_still_round_trips(self, db, tmp_path):
+        # The base profile keeps projections and linksInSequence; the importer
+        # reads both forms.
+        from pid_transit.adapters.netex_export_profiles import ExportProfile
+        zip_path = tmp_path / "feed.zip"
+        zip_path.write_bytes(make_gtfs_zip(MULTIHOP_GTFS_RECORDS))
+        GtfsImporter().import_to_db(db, zip_path)
+        out = tmp_path / "cen.xml"
+        NetexExporter(profile=ExportProfile(),
+                      deduplicate_patterns=False).export_from_db(db, out)
+        xml = out.read_text(encoding="utf-8")
         assert xml.count("<LinkSequenceProjection ") == 3
         assert xml.count("<ServiceLinkInJourneyPattern ") == 3
+        db2 = TransmodelDatabase(":memory:")
+        NetexImporter().import_to_db(db2, out)
+        assert db2.count_distinct("shape_point", "shape_id") == db.count_distinct(
+            "shape_point", "shape_id")
 
     def test_links_carry_their_endpoints(self, exported):
         _db, _path, xml = exported
@@ -752,7 +773,7 @@ class TestShapeGeometryOnServiceLinks:
         assert frame is not None
         emitted = [child.tag.replace(ns, "") for child in frame]
 
-        expected_order = ["ValidBetween", "TypeOfFrameRef", "lines",
+        expected_order = ["ValidBetween", "TypeOfFrameRef", "directions", "lines",
                           "scheduledStopPoints", "serviceLinks",
                           "connections", "stopAssignments", "journeyPatterns"]
         assert "connections" in emitted, "fixture must exercise the transfers path"
@@ -1358,7 +1379,10 @@ class TestProfileDetection:
         importer.import_to_db(db, path)
         assert importer.last_profile is NetexProfile.PORTUGUESE
 
-    def test_generic_for_our_own_export(self, db, tmp_path, minimal_gtfs_records):
+    def test_european_for_our_own_epip_export(self, db, tmp_path, minimal_gtfs_records):
+        # The EPIP journey has no LineRef: it names its pattern, and the
+        # pattern names the line. That is the indirection the European reading
+        # is defined by, so our own EPIP export is now read as one.
         zip_path = tmp_path / "feed.zip"
         zip_path.write_bytes(make_gtfs_zip(minimal_gtfs_records))
         GtfsImporter().import_to_db(db, zip_path)
@@ -1367,7 +1391,7 @@ class TestProfileDetection:
         db2 = TransmodelDatabase(":memory:")
         importer = NetexImporter()
         importer.import_to_db(db2, out)
-        assert importer.last_profile is NetexProfile.GENERIC
+        assert importer.last_profile is NetexProfile.EUROPEAN
 
     def test_european_detected(self, db, tmp_path):
         path = tmp_path / "fluo.xml"
