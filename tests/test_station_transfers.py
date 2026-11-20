@@ -104,19 +104,51 @@ class TestValidation:
 
 
 class TestNetexExport:
-    """NeTEx Connections reference scheduled stop points, and the EPIP
-    export writes no station, so a station end has nothing to point at."""
+    """A NeTEx Connection joins two scheduled stop points. Under a profile
+    that writes the station structure (epip-stations), a transfer with a
+    station end becomes a SiteConnection whose end is the station's
+    StopPlace; a profile that writes no station still counts it as lost."""
 
-    def test_only_stop_point_transfers_are_written_and_the_rest_counted(
-            self, feed, tmp_path):
+    def test_station_transfers_are_site_connections(self, feed, tmp_path):
         ds = _import(feed)
         out = tmp_path / "feed.xml"
-        losses = NetexExporter().export_from_db(ds.db, out)
+        losses = NetexExporter(profile="epip-stations").export_from_db(ds.db, out)
         xml = out.read_text(encoding="utf-8")
         connections = xml.split("<connections>")[1].split("</connections>")[0]
         assert connections.count("<Connection ") == 1
-        assert 'ref="ST1"' not in connections
+        assert connections.count("<SiteConnection ") == 2
+        assert '<StopPlaceRef ref="ST1"' in connections
+        assert "unsupported_transfer_station_end" not in losses
+
+    def test_netex_round_trip_keeps_every_transfer(self, feed, tmp_path):
+        from pid_transit.adapters.netex_importer import NetexImporter
+        ds = _import(feed)
+        out = tmp_path / "feed.xml"
+        NetexExporter(profile="epip-stations").export_from_db(ds.db, out)
+        back = TransitDataset(":memory:")
+        stats = back.import_data(NetexImporter(), out)
+        key = lambda r: (r["from_stop_id"], r["to_stop_id"], r["transfer_type"],
+                         r["min_transfer_time"])
+        assert sorted(map(key, back.db.get_records("transfer"))) == \
+            sorted(map(key, ds.db.get_records("transfer")))
+        assert not any(k.startswith(("skipped_", "dropped_")) for k in stats)
+
+    def test_epip_writes_no_station_and_counts_them(self, feed, tmp_path):
+        # The EPIP StopPlace admits quays only, so there is no StopPlace for
+        # a station end to reference.
+        ds = _import(feed)
+        out = tmp_path / "epip.xml"
+        losses = NetexExporter(profile="epip").export_from_db(ds.db, out)
+        connections = out.read_text(encoding="utf-8").split(
+            "<connections>")[1].split("</connections>")[0]
+        assert "<SiteConnection " not in connections
+        assert connections.count("<Connection ") == 1
         assert losses["unsupported_transfer_station_end"] == 2
+
+    def test_a_profile_without_connections_still_counts_them(self, feed, tmp_path):
+        ds = _import(feed)
+        losses = NetexExporter(profile="pt").export_from_db(ds.db, tmp_path / "pt.xml")
+        assert losses["unsupported_transfer"] == 3
 
 
 class TestMigration:

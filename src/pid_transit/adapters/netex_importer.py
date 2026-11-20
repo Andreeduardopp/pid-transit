@@ -236,6 +236,7 @@ class _RunState:
         self.site_children: set = set()              # StopPlace ids that contain anything
         self.levels: Dict[str, tuple] = {}           # Level id -> (GTFS id, name, index)
         self.path_links: List[dict] = []
+        self.station_ids: set = set()               # StopPlaces imported as stations
         self.quay_platform: Dict[str, str] = {}     # Quay id -> ScheduledStopPoint id
         self.route_to_line: Dict[str, str] = {}     # Route id -> Line id
         self.line_ids: set = set()
@@ -259,6 +260,10 @@ class _RunState:
         # different files, so both are buffered and joined at flush time.
         self.link_geometry: Dict[str, List[tuple]] = {}   # link id -> [(lat, lon), ...]
         self.jp_links: Dict[str, List[str]] = {}          # pattern id -> ordered link ids
+        # Direction id -> DirectionType, and pattern id -> DirectionRef: the
+        # EPIP pattern names its direction by reference only.
+        self.directions: Dict[str, str] = {}
+        self.jp_direction_ref: Dict[str, str] = {}
         # The document's own locale, from CompositeFrame/FrameDefaults. A NeTEx
         # time is a local time and this is the only place the file says which
         # local, so it is read before any operator is written and applied to all
@@ -898,7 +903,14 @@ class NetexImporter:
             refs = []
             for end in ("n:From", "n:To"):
                 end_el = conn.find(end, self._ns)
-                ref_el = end_el.find("n:ScheduledStopPointRef", self._ns) if end_el is not None else None
+                ref_el = None
+                if end_el is not None:
+                    # A Connection end is a stop point; a SiteConnection end may
+                    # also be a StopPlace -- a GTFS transfer that names a station.
+                    for tag in ("n:ScheduledStopPointRef", "n:StopPlaceRef"):
+                        ref_el = end_el.find(tag, self._ns)
+                        if ref_el is not None:
+                            break
                 refs.append(ref_el.attrib.get("ref") if ref_el is not None else None)
             if not (refs[0] and refs[1]):
                 return
@@ -917,6 +929,12 @@ class NetexImporter:
                 "transfer_type": transfer_type,
                 "min_transfer_time": duration,
             })
+
+        def on_direction(d: ET.Element) -> None:
+            did = d.attrib.get("id")
+            value = _text(d.find("n:DirectionType", self._ns))
+            if did and value:
+                state.directions[did] = value
 
         def on_service_link(link: ET.Element) -> None:
             """A hop's geometry, in either form the CEN LinkGroup allows.
@@ -946,7 +964,15 @@ class NetexImporter:
             if not jpid:
                 return
             direction = _text(jp.find("n:DirectionType", self._ns))
+            if direction is None:
+                dref = jp.find("n:DirectionRef", self._ns)
+                if dref is not None and dref.attrib.get("ref"):
+                    state.jp_direction_ref[jpid] = dref.attrib["ref"]
             route_ref_el = jp.find("n:RouteRef", self._ns)
+            if route_ref_el is None:
+                # RouteView/LineRef: the pattern names its line directly. The
+                # flush below accepts a line id where a route id is expected.
+                route_ref_el = jp.find("n:RouteView/n:LineRef", self._ns)
             route_ref = route_ref_el.attrib.get("ref") if route_ref_el is not None else None
 
             # Preferred form: geometry lives on ServiceLinks and the pattern
@@ -990,6 +1016,7 @@ class NetexImporter:
                         except ValueError:
                             logger.warning("Invalid gml:posList on pattern %s", jpid)
             points = []
+            onward = []
             seq = jp.find("n:pointsInSequence", self._ns)
             if seq is not None:
                 for spi in seq.findall("n:StopPointInJourneyPattern", self._ns):
@@ -1000,6 +1027,15 @@ class NetexImporter:
                             spi.attrib.get("id"),
                             ssp_ref.attrib.get("ref"),
                         ))
+                        link_ref = spi.find("n:OnwardServiceLinkRef", self._ns)
+                        if link_ref is not None and link_ref.attrib.get("ref"):
+                            onward.append((int(spi.attrib.get("order", 0)),
+                                           link_ref.attrib["ref"]))
+            if jpid not in state.jp_links and onward and len(onward) == len(points) - 1:
+                # The EPIP form of linksInSequence: each stop names the link
+                # to the next one. Only a complete chain is a shape.
+                onward.sort(key=lambda t: t[0])
+                state.jp_links[jpid] = [ref for _o, ref in onward]
             state.patterns[jpid] = (direction, route_ref, points)
 
         def on_service_journey(sj: ET.Element) -> None:
@@ -1082,10 +1118,12 @@ class NetexImporter:
             "UicOperatingPeriod": on_operating_period,
             "AvailabilityCondition": on_availability_condition,
             "Connection": on_connection,
+            "SiteConnection": on_connection,
             "ServiceLink": on_service_link,
             "JourneyPattern": on_pattern,
             # Subtypes used by production feeds (e.g. the Swiss profile).
             "ServiceJourneyPattern": on_pattern,
+            "Direction": on_direction,
             "ServiceJourney": on_service_journey,
             "TemplateServiceJourney": on_service_journey,
         }
@@ -1207,9 +1245,12 @@ class NetexImporter:
             logger.info("Imported %d operating day exceptions", len(exceptions))
 
         if state.transfers:
+            # GTFS lets a transfer name a station, which the model keeps as a
+            # stop area; the station structure was flushed above.
+            transfer_ends = state.stop_ids | state.station_ids
             transfer_rows = [
                 t for t in state.transfers
-                if t["from_stop_id"] in state.stop_ids and t["to_stop_id"] in state.stop_ids
+                if t["from_stop_id"] in transfer_ends and t["to_stop_id"] in transfer_ends
             ]
             dropped = len(state.transfers) - len(transfer_rows)
             if dropped:
@@ -1332,6 +1373,8 @@ class NetexImporter:
         patterns = []
         points = []
         for jpid, (direction, route_ref, spi_points) in state.patterns.items():
+            if direction is None and jpid in state.jp_direction_ref:
+                direction = state.directions.get(state.jp_direction_ref[jpid])
             # A pattern's RouteRef names a Route, which in turn names the Line;
             # minimal feeds (and our own exporter) may reference the Line
             # directly. Fall back to the line seen on this pattern's journeys.
@@ -1419,6 +1462,7 @@ class NetexImporter:
             state.add_stat("level", db.upsert("level", list(levels.values()), validate=False))
 
         stations = self._stations(state)
+        state.station_ids = set(stations)
         areas = []
         order = {sid: i for i, sid in enumerate(state.stop_places)}
         for sid in sorted(stations, key=order.__getitem__):
@@ -1571,7 +1615,7 @@ class _Pass2:
         "MobilityImpairedAccess", "TimetabledPassingTime",
         "StopPointInJourneyPatternRef", "ArrivalTime", "ArrivalDayOffset",
         "Call", "ScheduledStopPointRef", "Arrival", "Departure", "Time",
-        "DayOffset", "JourneyPatternView",
+        "DayOffset", "JourneyPatternView", "keyList", "KeyValue", "Key", "Value",
     )
 
     def handlers(self) -> Dict[str, callable]:
@@ -1697,6 +1741,23 @@ class _Pass2:
             elif tag == Q["frequencyGroups"]:
                 if freq_groups is None:
                     freq_groups = child
+            elif tag == Q["keyList"]:
+                # The EPIP journey has no AccessibilityAssessment; our exporter
+                # keeps the GTFS flag here instead.
+                for kv in child:
+                    if kv.tag != Q["KeyValue"]:
+                        continue
+                    key = value = None
+                    for part in kv:
+                        if part.tag == Q["Key"]:
+                            key = _text(part)
+                        elif part.tag == Q["Value"]:
+                            value = _text(part)
+                    if key == "gtfs_wheelchair_accessible" and value is not None:
+                        try:
+                            wheelchair = int(value)
+                        except ValueError:
+                            pass
             elif tag == Q["AccessibilityAssessment"]:
                 if wheelchair is None:
                     for r in child:

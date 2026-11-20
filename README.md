@@ -346,7 +346,7 @@ from pid_transit import TransitDataset, NetexExporter
 
 dataset = TransitDataset("my_city.db")
 exporter = NetexExporter(
-    profile="EPIP",             # accepted but currently inert — see note below
+    profile="epip",             # "epip" (default), "epip-stations" or "pt"
     deduplicate_patterns=True,  # reduces output size significantly
     compress=False,             # set True for .gz output
 )
@@ -354,14 +354,18 @@ exporter = NetexExporter(
 dataset.export_data(exporter, "output_netex.xml")
 ```
 
-> **Note:** `profile` is accepted but has no effect yet. The exporter emits generic CEN
-> NeTEx 1.3, not a profile-constrained document. Profile-aware export (EPIP and national
-> profiles) is planned, not shipped — if your National Access Point enforces a profile,
-> validate the output against that profile before submitting.
+> **Profiles.** `epip` writes the shape the EPIP XSD published by CEN
+> ([NeTEx-Profile-EPIP](https://github.com/NeTEx-CEN/NeTEx-Profile-EPIP)) admits; the
+> output also validates against the full CEN NeTEx 1.3 schema. The EPIP StopPlace holds
+> quays only, so a GTFS station feed loses its stations, entrances, generic nodes, levels
+> and pathways under `epip`, and the exporter counts them. `epip-stations` writes them as
+> the CEN StopPlace structure: the document validates against the full CEN schema, not
+> against the EPIP XSD. `pt` writes the Portuguese national profile. Whatever a profile
+> cannot carry is returned by the export as `unsupported_*` counts.
 
 The `deduplicate_patterns` option groups journey patterns with identical stop sequences (same line, direction, and ordered stops), writing only canonical patterns and remapping references. This can reduce NeTEx output from thousands of duplicate patterns to a few hundred unique ones.
 
-The export includes calendar validity (`ValidBetween`) and exceptions (`DayTypeAssignment`), shapes (`LinkSequenceProjection` with `gml:posList` on the journey pattern), transfers (`Connection`), frequencies (`TemplateServiceJourney`/`HeadwayJourneyGroup`), and wheelchair accessibility (`AccessibilityAssessment`) — all of which the NeTEx importer reads back, so GTFS → NeTEx → GTFS round-trips are lossless for these fields (`bikes_allowed` is GTFS-only).
+The export includes calendar validity (`ValidBetween`) and exceptions (`DayTypeAssignment`), shapes (`ServiceLink` geometry, named by each stop's `OnwardServiceLinkRef`), transfers (`Connection`), frequencies (`TemplateServiceJourney`/`HeadwayJourneyGroup`), and wheelchair accessibility (`AccessibilityAssessment` on stops; on journeys, a `keyList` entry, since the EPIP journey has no assessment) — all of which the NeTEx importer reads back, so GTFS → NeTEx → GTFS round-trips are lossless for these fields (`bikes_allowed` is GTFS-only).
 
 ### Converting a feed in one call
 

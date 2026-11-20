@@ -111,7 +111,7 @@ def feed(tmp_path):
     return path
 
 
-def _netex_round_trip(feed, tmp_path, profile="epip"):
+def _netex_round_trip(feed, tmp_path, profile="epip-stations"):
     source = TransitDataset(":memory:")
     source.import_data(GtfsImporter(), feed)
     netex = tmp_path / "stations.xml"

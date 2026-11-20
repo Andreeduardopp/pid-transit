@@ -381,12 +381,26 @@ class TestNetexSaysWhatTheModelHolds:
     def test_the_feed_keeps_its_provenance(self, roundtripped):
         # The whole feed_info table used to disappear, and with it the publisher,
         # the validity window and the version -- who made the file and for when.
-        _, back, _ = roundtripped
+        # The EPIP DataSource holds a name, a description and an email only.
+        # Without the publisher URL, which GTFS requires, the record cannot be
+        # rebuilt, so under EPIP the fields it cannot hold are counted; the
+        # CEN form keeps them all (test below).
+        _, _, losses = roundtripped
+        for field in ("publisher_url", "start_date", "end_date", "version"):
+            assert losses[f"unsupported_field_feed_info_{field}"] == 1
+
+    def test_the_cen_form_keeps_the_whole_provenance(self, roundtripped, tmp_path):
+        from pid_transit.adapters.netex_export_profiles import ExportProfile
+        from pid_transit.adapters.netex_exporter import NetexExporter
+        from pid_transit.adapters.netex_importer import NetexImporter
+        source, _, _ = roundtripped
+        netex = tmp_path / "cen.xml"
+        source.export_data(NetexExporter(profile=ExportProfile(),
+                                         deduplicate_patterns=False), netex)
+        back = TransitDataset(":memory:")
+        back.import_data(NetexImporter(), netex)
         info = back.db.get_records("feed_info")
-        assert len(info) == 1
-        assert info[0]["publisher_name"] == "Test Publisher"
         assert info[0]["publisher_url"] == "https://example.com"
-        assert info[0]["lang"] == "en"
         assert (info[0]["start_date"], info[0]["end_date"]) == ("20260101", "20261231")
         assert info[0]["version"] == "1.0"
 
@@ -417,10 +431,26 @@ class TestNetexSaysWhatTheModelHolds:
             if expected:
                 assert losses.get(f"unsupported_{table}") == expected, table
 
-    def test_the_station_structure_comes_back(self, roundtripped):
-        # Stations and levels have a home (StopPlace, Level): not
-        # counted, and back with the same values.
-        source, back, losses = roundtripped
+    def test_epip_counts_the_station_structure(self, roundtripped):
+        # The EPIP StopPlace admits quays only, so stations and levels are
+        # counted rather than written.
+        source, _, losses = roundtripped
+        for table in ("stop_area", "level"):
+            if source.db.get_records(table):
+                assert losses.get(f"unsupported_{table}") == len(
+                    source.db.get_records(table)), table
+
+    def test_the_station_structure_comes_back(self, roundtripped, tmp_path):
+        # Under epip-stations, stations and levels have a home (StopPlace,
+        # Level): not counted, and back with the same values.
+        from pid_transit.adapters.netex_exporter import NetexExporter
+        from pid_transit.adapters.netex_importer import NetexImporter
+        source, _, _ = roundtripped
+        netex = tmp_path / "stations.xml"
+        losses = source.export_data(NetexExporter(profile="epip-stations",
+                                                  deduplicate_patterns=False), netex)
+        back = TransitDataset(":memory:")
+        back.import_data(NetexImporter(), netex)
         for table in ("stop_area", "level"):
             assert f"unsupported_{table}" not in losses
             assert back.db.get_records(table) == source.db.get_records(table) or (

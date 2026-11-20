@@ -170,6 +170,47 @@ class ExportProfile:
     #: "passingTimes" (TimetabledPassingTime) or "calls" (Call).
     stop_times_element = "passingTimes"
 
+    # -- the EPIP XSD's narrower shapes ------------------------------------
+    #: The EPIP XSD (github.com/NeTEx-CEN/NeTEx-Profile-EPIP) is a subset of
+    #: the CEN schema, and in several places it admits only one of the forms
+    #: CEN allows. The base keeps the CEN form this exporter always wrote, so
+    #: the profiles that inherit it (PT) do not move; `EpipProfile` switches
+    #: each one to the form the EPIP XSD admits, and every switch is also
+    #: valid CEN. Measured: the 0.7.4 EPIP export of Porto failed the EPIP
+    #: XSD with 24 969 errors, all from these families.
+    #:
+    #: "JourneyPattern" or "ServiceJourneyPattern" -- EPIP lists only the
+    #: subtype, and a journey then references it as ServiceJourneyPatternRef.
+    journey_pattern_element = "JourneyPattern"
+    #: The pattern names its line through RouteView/LineRef. EPIP requires a
+    #: RouteRef or a RouteView on every pattern and has no LineRef on the
+    #: journey, so this is the only place the journey's line can be stated.
+    pattern_line_as_route_view = False
+    #: The pattern's direction as a DirectionRef to a Direction in the
+    #: ServiceFrame's `directions`, instead of a DirectionType child that the
+    #: EPIP pattern does not have.
+    pattern_direction_as_ref = False
+    #: A pattern's ServiceLinks named one per stop, as the onward link of
+    #: each StopPointInJourneyPattern, instead of a linksInSequence the EPIP
+    #: pattern does not have.
+    pattern_links_as_onward_refs = False
+    #: LineRef on the ServiceJourney. EPIP's ServiceJourney has none.
+    journey_writes_line_ref = True
+    #: The journey's wheelchair flag in its keyList. EPIP's ServiceJourney has
+    #: no AccessibilityAssessment, and the flag would otherwise be lost.
+    journey_accessibility_in_key_list = False
+    #: The hop's geometry inside projections/LinkSequenceProjection, or as a
+    #: gml:LineString directly on the ServiceLink (the only form EPIP admits).
+    service_link_projection = True
+    #: A PassengerStopAssignment that names the StopPlace before the Quay.
+    #: EPIP makes StopPlaceRef mandatory there.
+    assignment_writes_stop_place_ref = False
+    #: EPIP makes ContactDetails and OrganisationType mandatory on an Operator.
+    operator_contact_and_type_required = False
+    #: Day types and their assignments inside one ServiceCalendar. EPIP's
+    #: ServiceCalendarFrame admits nothing else.
+    calendar_in_service_calendar = False
+
     #: Closed enumerations, or None for "the profile does not restrict this".
     #: A value outside the set is written anyway and counted -- see
     #: `vehicle_mode`.
@@ -541,16 +582,76 @@ class ExportProfile:
 
 
 class EpipProfile(ExportProfile):
-    """EPIP, named.
+    """EPIP, in the shape the EPIP XSD admits.
 
-    Overrides nothing, and that is the finding rather than a gap: the base
-    class *is* EPIP, because EPIP is what this exporter already wrote. Keeping
-    the empty subclass makes ``--profile epip`` mean something specific rather
-    than "the default", and gives the first genuinely EPIP-only decision a home
-    that is not the base class.
+    The base class is the CEN form of everything this exporter writes, and
+    for a long time this subclass overrode nothing: EPIP was taken to be that
+    form. Validating against the EPIP XSD published by CEN
+    (github.com/NeTEx-CEN/NeTEx-Profile-EPIP, `NeTEx_publication_EPIP.xsd`)
+    showed otherwise -- the EPIP XSD narrows the CEN choices in the places the
+    flags below name. This class makes those choices; the base keeps the CEN
+    ones, so the profiles that inherit it do not change.
+
+    The station structure is not written here. The EPIP StopPlace admits
+    quays only -- levels, entrances, access spaces and path links are the
+    accessibility profile's (EPIAP) -- so a GTFS station feed exported to EPIP
+    reports those records as not carried. `EpipStationsProfile` writes them.
     """
 
     name = "epip"
+
+    writes_station_structure = False
+    writes_stop_point_location = True
+
+    journey_pattern_element = "ServiceJourneyPattern"
+    pattern_line_as_route_view = True
+    pattern_direction_as_ref = True
+    pattern_links_as_onward_refs = True
+    journey_writes_line_ref = False
+    journey_accessibility_in_key_list = True
+    service_link_projection = False
+    assignment_writes_stop_place_ref = True
+    operator_contact_and_type_required = True
+    calendar_in_service_calendar = True
+
+    #: Two narrowings of the base map:
+    #:
+    #: * the EPIP DataSource is Name, Description and Email -- no ValidBetween
+    #:   and no keyList -- so the feed's validity, version, publisher URL and
+    #:   contact URL are counted;
+    #: * without the station structure, a stop's station, its level and the
+    #:   station records themselves have nowhere to go, and are counted (the
+    #:   three station entities whole).
+    WRITTEN_FIELDS = {
+        **{k: v for k, v in ExportProfile.WRITTEN_FIELDS.items()
+           if k not in ("stop_area", "level", "pathway")},
+        "scheduled_stop_point": ExportProfile.WRITTEN_FIELDS["scheduled_stop_point"]
+        - {"stop_area_id", "level_id"},
+        "feed_info": frozenset({"id", "publisher_name", "lang",
+                                "contact_email"}),
+    }
+
+
+class EpipStationsProfile(EpipProfile):
+    """EPIP plus the GTFS station structure.
+
+    Everything `EpipProfile` writes, and each GTFS station as a StopPlace with
+    its levels, entrances, quays, access spaces and path links. The extra
+    elements are CEN-valid but outside the EPIP XSD, which admits quays only:
+    the document validates against the full CEN schema and not against the
+    EPIP one. It is the profile to use when the station layout must survive a
+    NeTEx round trip.
+    """
+
+    name = "epip-stations"
+    description = "EPIP plus the station structure (CEN-valid, beyond the EPIP XSD)"
+
+    writes_station_structure = True
+
+    WRITTEN_FIELDS = {
+        **ExportProfile.WRITTEN_FIELDS,
+        "feed_info": EpipProfile.WRITTEN_FIELDS["feed_info"],
+    }
 
 
 class PortugueseExportProfile(ExportProfile):
@@ -675,6 +776,7 @@ class PortugueseExportProfile(ExportProfile):
 
 _PROFILES = {
     "epip": EpipProfile,
+    "epip-stations": EpipStationsProfile,
     "pt": PortugueseExportProfile,
     "portuguese": PortugueseExportProfile,
 }
