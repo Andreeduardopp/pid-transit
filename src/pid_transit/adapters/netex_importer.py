@@ -236,6 +236,7 @@ class _RunState:
         self.site_children: set = set()              # StopPlace ids that contain anything
         self.levels: Dict[str, tuple] = {}           # Level id -> (GTFS id, name, index)
         self.path_links: List[dict] = []
+        self.station_ids: set = set()               # StopPlaces imported as stations
         self.quay_platform: Dict[str, str] = {}     # Quay id -> ScheduledStopPoint id
         self.route_to_line: Dict[str, str] = {}     # Route id -> Line id
         self.line_ids: set = set()
@@ -902,7 +903,14 @@ class NetexImporter:
             refs = []
             for end in ("n:From", "n:To"):
                 end_el = conn.find(end, self._ns)
-                ref_el = end_el.find("n:ScheduledStopPointRef", self._ns) if end_el is not None else None
+                ref_el = None
+                if end_el is not None:
+                    # A Connection end is a stop point; a SiteConnection end may
+                    # also be a StopPlace -- a GTFS transfer that names a station.
+                    for tag in ("n:ScheduledStopPointRef", "n:StopPlaceRef"):
+                        ref_el = end_el.find(tag, self._ns)
+                        if ref_el is not None:
+                            break
                 refs.append(ref_el.attrib.get("ref") if ref_el is not None else None)
             if not (refs[0] and refs[1]):
                 return
@@ -1110,6 +1118,7 @@ class NetexImporter:
             "UicOperatingPeriod": on_operating_period,
             "AvailabilityCondition": on_availability_condition,
             "Connection": on_connection,
+            "SiteConnection": on_connection,
             "ServiceLink": on_service_link,
             "JourneyPattern": on_pattern,
             # Subtypes used by production feeds (e.g. the Swiss profile).
@@ -1236,9 +1245,12 @@ class NetexImporter:
             logger.info("Imported %d operating day exceptions", len(exceptions))
 
         if state.transfers:
+            # GTFS lets a transfer name a station, which the model keeps as a
+            # stop area; the station structure was flushed above.
+            transfer_ends = state.stop_ids | state.station_ids
             transfer_rows = [
                 t for t in state.transfers
-                if t["from_stop_id"] in state.stop_ids and t["to_stop_id"] in state.stop_ids
+                if t["from_stop_id"] in transfer_ends and t["to_stop_id"] in transfer_ends
             ]
             dropped = len(state.transfers) - len(transfer_rows)
             if dropped:
@@ -1450,6 +1462,7 @@ class NetexImporter:
             state.add_stat("level", db.upsert("level", list(levels.values()), validate=False))
 
         stations = self._stations(state)
+        state.station_ids = set(stations)
         areas = []
         order = {sid: i for i, sid in enumerate(state.stop_places)}
         for sid in sorted(stations, key=order.__getitem__):

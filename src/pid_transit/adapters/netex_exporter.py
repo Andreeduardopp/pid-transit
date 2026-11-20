@@ -514,6 +514,9 @@ class NetexExporter:
         # ServiceFrame writer and read by the TimetableFrame writer, which must
         # not then reference points that were never written.
         self._degenerate_jps: set = set()
+        # Stations the SiteFrame wrote as StopPlaces; a transfer that names
+        # one becomes a SiteConnection in the ServiceFrame.
+        self._station_ids: set = set()
 
         # Read once, up front: the locale has to be written on the CompositeFrame,
         # which is built before the frame that holds the operators it comes from.
@@ -700,6 +703,7 @@ class NetexExporter:
 
         # Stations first: each one a StopPlace holding its platforms as Quays.
         if layout is not None:
+            self._station_ids = {st["id"] for st in layout.stations}
             for station in layout.stations:
                 self._write_station(stop_places, station, layout, states_wheelchair)
 
@@ -1227,19 +1231,35 @@ class NetexExporter:
             transfers = []
         if transfers:
             # A Connection joins two ScheduledStopPoints. A GTFS transfer may
-            # name a station, which this exporter does not write as a stop
-            # point, so such a transfer has nothing to reference.
+            # name a station; when the SiteFrame wrote that station as a
+            # StopPlace, the transfer is a SiteConnection, whose ends may be a
+            # stop point or a StopPlace. With no StopPlace to point at (a
+            # profile without the station structure) it has nothing to
+            # reference, and is counted.
             point_ids = {r["id"] for r in db.get_records("scheduled_stop_point")}
-            kept = [t for t in transfers
-                    if t["from_stop_id"] in point_ids and t["to_stop_id"] in point_ids]
+            station_ids = self._station_ids
+
+            def end_tag(stop_id):
+                if stop_id in point_ids:
+                    return "ScheduledStopPointRef"
+                if stop_id in station_ids:
+                    return "StopPlaceRef"
+                return None
+
+            kept = []
+            for t in transfers:
+                tags = (end_tag(t["from_stop_id"]), end_tag(t["to_stop_id"]))
+                if None not in tags:
+                    kept.append((t, tags))
             profile.note_unsupported("transfer_station_end", len(transfers) - len(kept))
-            transfers = kept
-        if transfers:
+        if transfers and kept:
             connections = profile.container(frame, "connections")
-            for i, tr in enumerate(transfers, 1):
+            for i, (tr, tags) in enumerate(kept, 1):
+                kind = ("Connection" if tags == ("ScheduledStopPointRef",) * 2
+                        else "SiteConnection")
                 conn = ET.SubElement(
-                    connections, "Connection",
-                    attrib=profile.entity_attrs(profile.object_id("Connection", i)))
+                    connections, kind,
+                    attrib=profile.entity_attrs(profile.object_id(kind, i)))
                 if tr.get("transfer_type") and profile.states("transfer", "transfer_type"):
                     key_list = ET.SubElement(conn, "keyList")
                     kv = ET.SubElement(key_list, "KeyValue")
@@ -1249,14 +1269,10 @@ class NetexExporter:
                         and profile.states("transfer", "min_transfer_time")):
                     wtd = ET.SubElement(conn, "WalkTransferDuration")
                     ET.SubElement(wtd, "DefaultDuration").text = f"PT{tr['min_transfer_time']}S"
-                from_el = ET.SubElement(conn, "From")
-                ET.SubElement(from_el, "ScheduledStopPointRef", attrib={
-                    "ref": tr["from_stop_id"], "version": "1"
-                })
-                to_el = ET.SubElement(conn, "To")
-                ET.SubElement(to_el, "ScheduledStopPointRef", attrib={
-                    "ref": tr["to_stop_id"], "version": "1"
-                })
+                for end, stop_id, tag in (("From", tr["from_stop_id"], tags[0]),
+                                          ("To", tr["to_stop_id"], tags[1])):
+                    end_el = ET.SubElement(conn, end)
+                    ET.SubElement(end_el, tag, attrib={"ref": stop_id, "version": "1"})
 
         _order_frame_children(frame, _SERVICE_FRAME_ORDER)
 
