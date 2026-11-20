@@ -137,7 +137,7 @@ class GtfsExporter:
                     "location_type": 0,
                     "parent_station": _v(sp.get("stop_area_id")),
                     "wheelchair_boarding": _v(sp.get("wheelchair_boarding")),
-                    "level_id": "",
+                    "level_id": _v(sp.get("level_id")),
                     "stop_code": _v(sp.get("code")),
                     "platform_code": _v(sp.get("platform_code")),
                     "zone_id": _v(sp.get("zone_id")),

@@ -409,14 +409,27 @@ class TestNetexSaysWhatTheModelHolds:
                             f"{table}.{field} left the document uncounted")
 
     def test_entities_with_no_netex_home_are_counted_whole(self, roundtripped):
-        # Fares, pathways, levels and attributions have no element this writer
-        # emits at all. That is a decision, not an accident, and it is a number.
+        # Fares and attributions have no element this writer emits at all.
+        # That is a decision, not an accident, and it is a number.
         source, _, losses = roundtripped
-        for table in ("fare_attribute", "fare_rule", "pathway", "level",
-                      "stop_area", "attribution"):
+        for table in ("fare_attribute", "fare_rule", "attribution"):
             expected = source.db.count(table)
             if expected:
                 assert losses.get(f"unsupported_{table}") == expected, table
+
+    def test_the_station_structure_comes_back(self, roundtripped):
+        # Stations and levels have a home (StopPlace, Level): not
+        # counted, and back with the same values.
+        source, back, losses = roundtripped
+        for table in ("stop_area", "level"):
+            assert f"unsupported_{table}" not in losses
+            assert back.db.get_records(table) == source.db.get_records(table) or (
+                [{k: v for k, v in r.items() if k != "extras"}
+                 for r in back.db.get_records(table)]
+                == [{k: v for k, v in r.items() if k != "extras"}
+                    for r in source.db.get_records(table)]), table
+        assert back.db.get_one("scheduled_stop_point", {"id": "S1"})[
+            "stop_area_id"] == "STATION1"
 
 
 class TestSchemaMigration:

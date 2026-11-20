@@ -66,12 +66,144 @@ def _wheelchair_to_access(value) -> str:
 
 
 def _write_accessibility(parent: ET.Element, entity_id: str, wheelchair) -> None:
-    if wheelchair not in (1, 2):
+    # 0 is GTFS's "no information", which is a statement, not an absence:
+    # until 2026-11 it was not written and came back empty.
+    if wheelchair not in (0, 1, 2):
         return
     assessment = ET.SubElement(parent, "AccessibilityAssessment", attrib={
         "id": f"{entity_id}:access", "version": "1"
     })
     ET.SubElement(assessment, "MobilityImpairedAccess").text = _wheelchair_to_access(wheelchair)
+
+
+def _write_centroid(parent: ET.Element, record: dict) -> None:
+    if record.get("lat") is not None and record.get("lon") is not None:
+        centroid = ET.SubElement(parent, "Centroid")
+        location = ET.SubElement(centroid, "Location")
+        ET.SubElement(location, "Longitude").text = str(record["lon"])
+        ET.SubElement(location, "Latitude").text = str(record["lat"])
+
+
+def _write_key_values(parent: ET.Element, values: Dict[str, str]) -> None:
+    """A keyList of GTFS values NeTEx has no exact slot for. First child of any
+    entity (CEN DataManagedObjectGroup comes before Name)."""
+    if not values:
+        return
+    key_list = ET.SubElement(parent, "keyList")
+    for key, value in values.items():
+        kv = ET.SubElement(key_list, "KeyValue")
+        ET.SubElement(kv, "Key").text = key
+        ET.SubElement(kv, "Value").text = value
+
+
+#: GTFS pathway_mode -> CEN AccessFeatureType. Fare and exit gates share
+#: `barrier`, so the exact mode also travels as KeyValue `gtfs_pathway_mode`.
+_PATHWAY_ACCESS_FEATURE = {
+    1: "footpath", 2: "stairs", 3: "travelator", 4: "escalator",
+    5: "lift", 6: "barrier", 7: "barrier",
+}
+
+
+class _StationLayout:
+    """The station structure of a feed, grouped once for the SiteFrame writer.
+
+    GTFS states a station tree by parent ids; NeTEx by containment. This reads
+    the stop areas, levels and pathways a single time and answers which
+    platforms, entrances, nodes, levels and pathways each station holds, so
+    the writer never scans the feed per station. What it cannot place is
+    counted here, against the profile, as the losses rule asks.
+    """
+
+    def __init__(self, db: TransmodelDatabase, stops: list, profile) -> None:
+        areas = db.get_records("stop_area")
+        self.levels = {lv["id"]: lv for lv in db.get_records("level")}
+        self.stations = [a for a in areas if a["location_type"] == 1]
+        station_ids = {a["id"] for a in self.stations}
+        self.area_station: Dict[str, str] = {a["id"]: a["id"] for a in self.stations}
+
+        self._children: Dict[tuple, list] = {}
+        unplaced = 0
+        for a in areas:
+            if a["location_type"] == 1:
+                continue
+            if a["location_type"] in (2, 3) and a.get("parent_id") in station_ids:
+                self._children.setdefault((a["parent_id"], a["location_type"]), []).append(a)
+                self.area_station[a["id"]] = a["parent_id"]
+            else:
+                # Boarding areas (4), and entrances or nodes with no station.
+                unplaced += 1
+        profile.note_unsupported("stop_area", unplaced)
+
+        self._platforms: Dict[str, list] = {}
+        self.platform_station: Dict[str, str] = {}
+        for sp in stops:
+            if sp.get("stop_area_id") in station_ids:
+                self._platforms.setdefault(sp["stop_area_id"], []).append(sp)
+                self.platform_station[sp["id"]] = sp["stop_area_id"]
+
+        # Which levels each station uses: its own, and its components'.
+        used: Dict[str, list] = {}
+        dangling = 0
+
+        def use(station_id: str, level_id) -> None:
+            nonlocal dangling
+            if not level_id:
+                return
+            if level_id not in self.levels:
+                dangling += 1
+                return
+            lst = used.setdefault(station_id, [])
+            if level_id not in lst:
+                lst.append(level_id)
+
+        for st in self.stations:
+            use(st["id"], st.get("level_id"))
+        for (sid, _), children in self._children.items():
+            for a in children:
+                use(sid, a.get("level_id"))
+        for sid, platforms in self._platforms.items():
+            for sp in platforms:
+                use(sid, sp.get("level_id"))
+        profile.note_dropped("level_ref", dangling)
+        self.station_levels = {sid: sorted(lst, key=lambda i: (self.levels[i]["index"], i))
+                               for sid, lst in used.items()}
+        written = {lid for lst in used.values() for lid in lst}
+        profile.note_unsupported("level", len(self.levels.keys() - written))
+
+        self.station_pathways: Dict[str, list] = {}
+        self.frame_pathways: list = []
+        unplaced = 0
+        for pw in db.get_records("pathway"):
+            ends = [self._station_of(pw["from_stop_id"]), self._station_of(pw["to_stop_id"])]
+            if None in ends:
+                unplaced += 1
+            elif ends[0] == ends[1]:
+                self.station_pathways.setdefault(ends[0], []).append(pw)
+            else:
+                self.frame_pathways.append(pw)
+        profile.note_unsupported("pathway", unplaced)
+
+    def _station_of(self, stop_id: str) -> Optional[str]:
+        return self.platform_station.get(stop_id) or self.area_station.get(stop_id)
+
+    def children(self, station_id: str, location_type: int) -> list:
+        return self._children.get((station_id, location_type), [])
+
+    def platforms(self, station_id: str) -> list:
+        return self._platforms.get(station_id, [])
+
+    def level_ref(self, station_id: str, level_id) -> Optional[str]:
+        """The id of a station's copy of a GTFS level, or None."""
+        if not level_id or level_id not in self.levels:
+            return None
+        return f"{station_id}:{level_id}"
+
+    def place_ref(self, stop_id: str) -> str:
+        """What a PathLink end points at: a platform's Quay, else the element
+        that carries the stop area's own id."""
+        if stop_id in self.platform_station:
+            return f"{stop_id}:Quay"
+        return stop_id
 
 
 # The CEN ServiceFrame is a sequence, not a bag: its children are valid only in
@@ -183,7 +315,10 @@ class NetexExporter:
 
     Frames produced (EPIP):
       ResourceFrame  — Operators
-      SiteFrame      — StopPlaces (with coordinates)
+      SiteFrame      — StopPlaces (with coordinates); a GTFS station is one
+                       StopPlace holding its levels, entrances, platforms
+                       (Quays), generic nodes (AccessSpaces) and pathways
+                       (SitePathLinks)
       ServiceFrame   — Lines, ScheduledStopPoints, JourneyPatterns
       TimetableFrame — DayTypes, ServiceJourneys, TimetabledPassingTimes
 
@@ -195,8 +330,8 @@ class NetexExporter:
     that appear are exactly the losses that happened.
 
     An EPIP export does *not* return ``{}`` for a rich feed, and that is the
-    point: GTFS carries block ids, headsigns, fares and pathways this model
-    keeps and this writer has no NeTEx home for. Until 2026-09-10 it returned
+    point: GTFS carries block ids, headsigns and fares this model keeps and
+    this writer has no NeTEx home for. Until 2026-09-10 it returned
     ``{}`` anyway, which was not fidelity but silence about six fields --
     including the timezone (see NETEX_EXPORT_AUDITORIA.md).
     """
@@ -549,18 +684,31 @@ class NetexExporter:
 
         states_wheelchair = profile.states("scheduled_stop_point",
                                           "wheelchair_boarding")
+        layout = (_StationLayout(db, stops, profile)
+                  if profile.writes_station_structure and profile.writes_quays
+                  else None)
+
+        # Stations first: each one a StopPlace holding its platforms as Quays.
+        if layout is not None:
+            for station in layout.stations:
+                self._write_station(stop_places, station, layout, states_wheelchair)
+
         for sp in stops:
+            if layout is not None and sp["id"] in layout.platform_station:
+                continue
+            if layout is not None:
+                # A platform with no station to sit in has no Level to point at.
+                if sp.get("level_id"):
+                    profile.note_dropped("scheduled_stop_point_level_id")
+                if sp.get("stop_area_id"):
+                    profile.note_dropped("scheduled_stop_point_stop_area_id")
             wheelchair = sp.get("wheelchair_boarding") if states_wheelchair else None
             el = ET.SubElement(stop_places, "StopPlace",
                                attrib=profile.entity_attrs(sp["id"]))
             ET.SubElement(el, "Name").text = sp["name"]
             if profile.states("scheduled_stop_point", "code") and sp.get("code"):
                 ET.SubElement(el, "PrivateCode").text = sp["code"]
-            if sp.get("lat") is not None and sp.get("lon") is not None:
-                centroid = ET.SubElement(el, "Centroid")
-                location = ET.SubElement(centroid, "Location")
-                ET.SubElement(location, "Longitude").text = str(sp["lon"])
-                ET.SubElement(location, "Latitude").text = str(sp["lat"])
+            _write_centroid(el, sp)
             _write_accessibility(el, sp["id"], wheelchair)
             ET.SubElement(el, "StopPlaceType").text = self._stop_type(sp["id"])
 
@@ -578,15 +726,166 @@ class NetexExporter:
             # These were emitted as a top-level <quays> sibling of <stopPlaces>
             # until 2026-09-07, which the CEN SiteFrame does not admit.
             quays_el = ET.SubElement(el, "quays")
-            quay = ET.SubElement(quays_el, "Quay",
-                                 attrib=profile.entity_attrs(f"{sp['id']}:Quay"))
-            ET.SubElement(quay, "Name").text = sp["name"]
-            if sp.get("lat") is not None and sp.get("lon") is not None:
-                q_centroid = ET.SubElement(quay, "Centroid")
-                q_location = ET.SubElement(q_centroid, "Location")
-                ET.SubElement(q_location, "Longitude").text = str(sp["lon"])
-                ET.SubElement(q_location, "Latitude").text = str(sp["lat"])
-            _write_accessibility(quay, f"{sp['id']}:Quay", wheelchair)
+            self._write_quay(quays_el, sp, wheelchair, level_ref=None)
+
+        if layout is not None and layout.frame_pathways:
+            # A pathway whose two ends sit in different stations belongs to
+            # neither StopPlace; the SiteFrame holds it (CEN PathInFrameGroup).
+            links = ET.SubElement(frame, "pathLinks")
+            for pw in layout.frame_pathways:
+                self._write_path_link(links, "PathLink", pw, layout)
+
+    def _write_quay(self, parent: ET.Element, sp: dict, wheelchair,
+                    level_ref: Optional[str], in_station: bool = False) -> None:
+        """A platform's Quay, children in CEN Quay order.
+
+        A platform alone in its own StopPlace keeps its rider-facing code on
+        that StopPlace, as it always has; one inside a station has only the
+        Quay to carry it.
+        """
+        profile = self.profile
+        quay = ET.SubElement(parent, "Quay",
+                             attrib=profile.entity_attrs(f"{sp['id']}:Quay"))
+        ET.SubElement(quay, "Name").text = sp["name"]
+        if (in_station and sp.get("code")
+                and profile.states("scheduled_stop_point", "code")):
+            ET.SubElement(quay, "PrivateCode").text = sp["code"]
+        _write_centroid(quay, sp)
+        _write_accessibility(quay, f"{sp['id']}:Quay", wheelchair)
+        if level_ref:
+            ET.SubElement(quay, "LevelRef", attrib=profile.ref_attrs(level_ref))
+        if (sp.get("platform_code")
+                and profile.states("scheduled_stop_point", "platform_code")):
+            ET.SubElement(quay, "PublicCode").text = sp["platform_code"]
+
+    def _write_station(self, stop_places: ET.Element, station: dict,
+                       layout: "_StationLayout", states_wheelchair: bool) -> None:
+        """One GTFS station (location_type 1) as a StopPlace with its levels,
+        entrances, platforms (Quays), generic nodes (AccessSpaces) and the
+        pathways inside it (SitePathLinks), in the CEN StopPlace sequence."""
+        profile = self.profile
+        sid = station["id"]
+        el = ET.SubElement(stop_places, "StopPlace", attrib=profile.entity_attrs(sid))
+        if station.get("level_id"):
+            # A StopPlace has no LevelRef (it is not a SiteComponent); GTFS lets
+            # a station name one anyway, so it rides in the keyList.
+            _write_key_values(el, {"gtfs_level_id": station["level_id"]})
+        ET.SubElement(el, "Name").text = station["name"]
+        _write_centroid(el, station)
+        _write_accessibility(el, sid, station.get("wheelchair_boarding"))
+
+        level_ids = layout.station_levels.get(sid, ())
+        if level_ids:
+            levels_el = ET.SubElement(el, "levels")
+            for lid in level_ids:
+                self._write_level(levels_el, layout.levels[lid],
+                                  layout.level_ref(sid, lid))
+
+        entrances = layout.children(sid, 2)
+        if entrances:
+            ent_el = ET.SubElement(el, "entrances")
+            for area in entrances:
+                ent = ET.SubElement(ent_el, "StopPlaceEntrance",
+                                    attrib=profile.entity_attrs(area["id"]))
+                self._write_component_body(ent, area, sid, layout)
+
+        modes = {self._stop_modes.get(sp["id"]) for sp in layout.platforms(sid)}
+        modes.discard(None)
+        mode = (modes.pop() if len(modes) == 1
+                else (self._default_stop_mode if not modes else None))
+        ET.SubElement(el, "StopPlaceType").text = profile.stop_place_type(mode)
+
+        platforms = layout.platforms(sid)
+        if platforms:
+            quays_el = ET.SubElement(el, "quays")
+            for sp in platforms:
+                wheelchair = sp.get("wheelchair_boarding") if states_wheelchair else None
+                self._write_quay(quays_el, sp, wheelchair,
+                                 layout.level_ref(sid, sp.get("level_id")),
+                                 in_station=True)
+
+        nodes = layout.children(sid, 3)
+        if nodes:
+            spaces_el = ET.SubElement(el, "accessSpaces")
+            for area in nodes:
+                space = ET.SubElement(spaces_el, "AccessSpace",
+                                      attrib=profile.entity_attrs(area["id"]))
+                self._write_component_body(space, area, sid, layout)
+
+        pathways = layout.station_pathways.get(sid)
+        if pathways:
+            links_el = ET.SubElement(el, "pathLinks")
+            for pw in pathways:
+                self._write_path_link(links_el, "SitePathLink", pw, layout)
+
+    def _write_component_body(self, el: ET.Element, area: dict, station_id: str,
+                              layout: "_StationLayout") -> None:
+        """Name, Centroid, AccessibilityAssessment and LevelRef: the part of a
+        StopPlaceEntrance and an AccessSpace that comes from GTFS, in the order
+        the two share."""
+        ET.SubElement(el, "Name").text = area["name"]
+        _write_centroid(el, area)
+        _write_accessibility(el, area["id"], area.get("wheelchair_boarding"))
+        ref = layout.level_ref(station_id, area.get("level_id"))
+        if ref:
+            ET.SubElement(el, "LevelRef", attrib=self.profile.ref_attrs(ref))
+
+    def _write_level(self, parent: ET.Element, level: dict, level_id: str) -> None:
+        """A GTFS level, copied into one station.
+
+        NeTEx levels belong to a site and GTFS levels to the feed, so a level
+        shared by several stations is written once per station under a derived
+        id; the GTFS id travels in the keyList and the importer folds the
+        copies back into one level.
+        """
+        lv = ET.SubElement(parent, "Level", attrib=self.profile.entity_attrs(level_id))
+        index = level.get("index")
+        keys = {"gtfs_level_id": level["id"]}
+        integral = index is not None and float(index).is_integer()
+        if index is not None and not integral:
+            keys["gtfs_level_index"] = repr(float(index))
+        _write_key_values(lv, keys)
+        if level.get("name"):
+            ET.SubElement(lv, "Name").text = level["name"]
+        if integral:
+            ET.SubElement(lv, "RelativeLevelOrder").text = str(int(float(index)))
+
+    def _write_path_link(self, parent: ET.Element, tag: str, pw: dict,
+                         layout: "_StationLayout") -> None:
+        """A GTFS pathway as a (Site)PathLink, children in CEN order."""
+        profile = self.profile
+        link = ET.SubElement(parent, tag, attrib=profile.entity_attrs(pw["id"]))
+        keys = {"gtfs_pathway_mode": str(pw["pathway_mode"])}
+        if pw.get("max_slope") is not None:
+            # Gradient's unit is not GTFS's ratio; the exact value goes here.
+            keys["gtfs_max_slope"] = repr(float(pw["max_slope"]))
+        _write_key_values(link, keys)
+        if pw.get("length") is not None:
+            ET.SubElement(link, "Distance").text = repr(float(pw["length"]))
+        for end_tag, stop_id in (("From", pw["from_stop_id"]), ("To", pw["to_stop_id"])):
+            end = ET.SubElement(link, end_tag)
+            ET.SubElement(end, "PlaceRef",
+                          attrib=profile.ref_attrs(layout.place_ref(stop_id)))
+        if pw.get("signposted_as"):
+            ET.SubElement(link, "Towards").text = pw["signposted_as"]
+        if pw.get("reversed_signposted_as"):
+            ET.SubElement(link, "Back").text = pw["reversed_signposted_as"]
+        stairs = pw.get("stair_count")
+        if stairs is not None:
+            ET.SubElement(link, "NumberOfSteps").text = str(abs(int(stairs)))
+        if pw.get("min_width") is not None:
+            ET.SubElement(link, "MinimumWidth").text = repr(float(pw["min_width"]))
+        ET.SubElement(link, "AllowedUse").text = (
+            "twoWay" if pw["is_bidirectional"] else "oneWay")
+        if stairs:
+            # GTFS signs the count: positive climbs from `from` to `to`.
+            ET.SubElement(link, "Transition").text = "up" if int(stairs) > 0 else "down"
+        feature = _PATHWAY_ACCESS_FEATURE.get(int(pw["pathway_mode"]))
+        if feature:
+            ET.SubElement(link, "AccessFeatureType").text = feature
+        if pw.get("traversal_time") is not None:
+            duration = ET.SubElement(link, "TransferDuration")
+            ET.SubElement(duration, "DefaultDuration").text = f"PT{int(pw['traversal_time'])}S"
 
     # -------------------------------------------------------------------------
     # ServiceFrame — lines, scheduled stop points, journey patterns

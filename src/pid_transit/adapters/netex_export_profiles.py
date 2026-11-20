@@ -141,6 +141,13 @@ class ExportProfile:
     writes_routes = False
     writes_journey_patterns = True
     writes_quays = True
+    #: Stations, entrances, generic nodes, levels and pathways as the CEN
+    #: StopPlace structure (StopPlace > levels/entrances/quays/accessSpaces/
+    #: pathLinks). Needs Quays, because a station's platforms are its Quays.
+    #: Strictly this is more than EPIP's minimal stop model -- the detailed
+    #: structure is EPIAP's (CEN/TS 16614-6) -- but every element is CEN-valid,
+    #: and without it a GTFS station feed cannot survive the round trip.
+    writes_station_structure = True
     writes_stop_assignments = True
     writes_service_links = True
     writes_connections = True
@@ -207,8 +214,24 @@ class ExportProfile:
         "line": frozenset({"id", "operator_id", "name", "short_name",
                            "transport_mode", "color", "text_color",
                            "description", "url"}),
+        # stop_area_id and level_id are stated by containment and LevelRef in
+        # the station's StopPlace; platform_code is the Quay's PublicCode.
         "scheduled_stop_point": frozenset({"id", "name", "lat", "lon",
-                                           "wheelchair_boarding", "code"}),
+                                           "wheelchair_boarding", "code",
+                                           "stop_area_id", "level_id",
+                                           "platform_code"}),
+        # The station structure (writes_station_structure). A record the
+        # writer cannot place -- a boarding area, an entrance with no station
+        # -- is counted whole by the writer, not here.
+        "stop_area": frozenset({"id", "name", "lat", "lon", "location_type",
+                                "parent_id", "level_id",
+                                "wheelchair_boarding"}),
+        "level": frozenset({"id", "index", "name"}),
+        "pathway": frozenset({"id", "from_stop_id", "to_stop_id",
+                              "pathway_mode", "is_bidirectional", "length",
+                              "traversal_time", "stair_count", "max_slope",
+                              "min_width", "signposted_as",
+                              "reversed_signposted_as"}),
         "day_type": frozenset({"id", "monday", "tuesday", "wednesday",
                                "thursday", "friday", "saturday", "sunday",
                                "start_date", "end_date"}),
@@ -590,6 +613,7 @@ class PortugueseExportProfile(ExportProfile):
     writes_routes = True
     writes_journey_patterns = False
     writes_quays = False
+    writes_station_structure = False
     writes_stop_assignments = False
     writes_service_links = False
     writes_connections = False
@@ -621,7 +645,11 @@ class PortugueseExportProfile(ExportProfile):
     #:   profile states and EPIP does not.
     WRITTEN_FIELDS = {
         **{k: v for k, v in ExportProfile.WRITTEN_FIELDS.items()
-           if k != "feed_info"},
+           if k not in ("feed_info", "stop_area", "level", "pathway")},
+        # No Quay and only `stopPlaces` in the SiteFrame: the station structure
+        # has nowhere to go, and the entities above are counted whole.
+        "scheduled_stop_point": ExportProfile.WRITTEN_FIELDS["scheduled_stop_point"]
+        - {"stop_area_id", "level_id", "platform_code"},
         "line": ExportProfile.WRITTEN_FIELDS["line"] - {"color", "text_color"},
         "passing_time": (ExportProfile.WRITTEN_FIELDS["passing_time"]
                          | {"pickup_type", "drop_off_type"}),
