@@ -64,7 +64,7 @@ if TYPE_CHECKING:
         DirectionType,
     )
 
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 
 # Submodule -> the public names it defines. Resolved on first access.
 _LAZY_MODULES: dict[str, tuple[str, ...]] = {

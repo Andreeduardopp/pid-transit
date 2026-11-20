@@ -201,6 +201,8 @@ class ProfileRules:
         "ServiceCalendar", "AvailabilityCondition", "ServiceJourney",
         "TemplateServiceJourney", "Call", "JourneyPattern",
         "ServiceJourneyPattern", "Operator", "Authority", "ServiceLink",
+        # The station structure: versioned like every other entity.
+        "Level", "StopPlaceEntrance", "AccessSpace", "SitePathLink", "PathLink",
     })
     #: Element -> the set of values it may take.
     CLOSED_ENUMS: Dict[str, FrozenSet[str]] = {
@@ -218,6 +220,7 @@ class ProfileRules:
         "OperatorRef": "Operator",
         "AuthorityRef": "Authority",
         "QuayRef": "Quay",
+        "LevelRef": "Level",
         "JourneyPatternRef": "JourneyPattern",
         # The one CARRIS schema error that belongs to none of the four
         # attribute families: a DefaultCodespaceRef naming a Codespace the

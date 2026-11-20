@@ -5,6 +5,7 @@ This module provides a SQLite wrapper designed to hold Transmodel entities
 with full referential integrity.
 """
 
+import json
 import sqlite3
 import logging
 from contextlib import contextmanager
@@ -16,7 +17,7 @@ from .schemas import TRANSMODEL_ENTITIES
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "3.3.0-transmodel"
+SCHEMA_VERSION = "3.4.0-transmodel"
 
 _TABLE_SCHEMAS = {
     "operator": """
@@ -55,6 +56,7 @@ _TABLE_SCHEMAS = {
             wheelchair_boarding INTEGER,
             code                TEXT,
             platform_code       TEXT,
+            level_id            TEXT,
             zone_id             TEXT,
             description         TEXT,
             extras              TEXT
@@ -302,7 +304,10 @@ _MIGRATION_COLUMNS = {
     "line": {"text_color": "TEXT", "description": "TEXT", "url": "TEXT",
              "sort_order": "INTEGER"},
     "scheduled_stop_point": {"code": "TEXT", "platform_code": "TEXT",
-                             "zone_id": "TEXT", "description": "TEXT"},
+                             "zone_id": "TEXT", "description": "TEXT",
+                             # 3.4: a platform's level was kept only in extras,
+                             # which no NeTEx writer reads.
+                             "level_id": "TEXT"},
     "service_journey": {"headsign": "TEXT", "short_name": "TEXT",
                         "block_id": "TEXT"},
     "passing_time": {"pickup_type": "INTEGER", "drop_off_type": "INTEGER",
@@ -460,6 +465,7 @@ class TransmodelDatabase:
                 for ddl in _TABLE_SCHEMAS.values():
                     conn.execute(ddl)
                 self._migrate_add_missing_columns(conn)
+                self._migrate_stop_point_level_from_extras(conn)
                 for ddl in _INDEX_SCHEMAS.values():
                     conn.execute(ddl)
                 conn.execute(
@@ -487,6 +493,26 @@ class TransmodelDatabase:
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             if "extras" not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN extras TEXT")
+
+    @staticmethod
+    def _migrate_stop_point_level_from_extras(conn: sqlite3.Connection) -> None:
+        """3.3 -> 3.4: a platform's ``level_id`` became a column. Before, the
+        GTFS importer left it in ``extras``; move it out, so the column is the
+        one place it lives and the GTFS exporter does not write it twice."""
+        rows = conn.execute(
+            "SELECT id, extras FROM scheduled_stop_point "
+            "WHERE level_id IS NULL AND extras LIKE '%\"level_id\"%'").fetchall()
+        for sid, extras in rows:
+            try:
+                data = json.loads(extras)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(data, dict) or "level_id" not in data:
+                continue
+            level = data.pop("level_id") or None
+            conn.execute(
+                "UPDATE scheduled_stop_point SET level_id = ?, extras = ? WHERE id = ?",
+                (level, json.dumps(data, sort_keys=True, ensure_ascii=False) if data else None, sid))
 
     @staticmethod
     def _migrate_transfer_without_fk(conn: sqlite3.Connection) -> None:

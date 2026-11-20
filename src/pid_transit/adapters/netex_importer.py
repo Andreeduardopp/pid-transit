@@ -108,6 +108,16 @@ def _text(el: Optional[ET.Element]) -> Optional[str]:
     return None
 
 
+#: CEN AccessFeatureType -> GTFS pathway_mode, for a PathLink that does not
+#: carry the exact mode in its keyList (a file this library did not write).
+_ACCESS_FEATURE_PATHWAY = {
+    "footpath": 1, "passage": 1, "pavement": 1, "street": 1, "openSpace": 1,
+    "concourse": 1, "hall": 1, "ramp": 1, "crossing": 1,
+    "stairs": 2, "seriesOfStairs": 2,
+    "travelator": 3, "escalator": 4, "lift": 5, "barrier": 6,
+}
+
+
 def _localname(tag: str) -> str:
     return tag.rpartition("}")[2]
 
@@ -217,6 +227,16 @@ class _RunState:
         self.quays: Dict[str, tuple] = {}           # id -> (name, lat, lon, wheelchair, code)
         self.assignments: Dict[str, str] = {}       # ssp id -> quay/stop place id
         self.ssp_points: Dict[str, tuple] = {}      # ssp id -> (name, QuayRef attr, code)
+        # Station structure. Containment is the parent link: the StopPlaces
+        # open around an element when it starts (see _stream start hooks).
+        self.open_stop_places: List[Optional[str]] = []
+        self.stop_place_level: Dict[str, str] = {}   # StopPlace id -> GTFS level id (keyList)
+        self.quay_site: Dict[str, tuple] = {}        # Quay id -> (StopPlace id, LevelRef, PublicCode)
+        self.site_components: Dict[str, dict] = {}   # Entrance/AccessSpace id -> row
+        self.site_children: set = set()              # StopPlace ids that contain anything
+        self.levels: Dict[str, tuple] = {}           # Level id -> (GTFS id, name, index)
+        self.path_links: List[dict] = []
+        self.quay_platform: Dict[str, str] = {}     # Quay id -> ScheduledStopPoint id
         self.route_to_line: Dict[str, str] = {}     # Route id -> Line id
         self.line_ids: set = set()
         self.day_type_ids: set = set()
@@ -377,13 +397,14 @@ class NetexImporter:
             n = len(sources)
             self._total_files = n
             pass1_handlers = self._pass1_handlers(state)
+            pass1_start = self._pass1_start_handlers(state)
             for i, (label, opener) in enumerate(sources, 1):
                 self._check_cancel()
                 self._file_index = i
                 state.current_file = label
                 logger.info("NeTEx pass 1 (reference data, file %d/%d): %s", i, n, label)
                 with opener() as f:
-                    self._stream(f, pass1_handlers, label)
+                    self._stream(f, pass1_handlers, label, pass1_start)
                 # Whatever is still open never saw its frame close, so it never
                 # was one -- and must not straddle two files.
                 state.discard_frame()
@@ -433,7 +454,8 @@ class NetexImporter:
     # Streaming machinery
     # -------------------------------------------------------------------------
 
-    def _stream(self, source, handlers: Dict[str, callable], label: str = "") -> None:
+    def _stream(self, source, handlers: Dict[str, callable], label: str = "",
+                start_handlers: Optional[Dict[str, callable]] = None) -> None:
         """iterparse `source`, dispatch end-events for `handlers` tags, and
         prune each handled element so memory stays flat.
 
@@ -444,6 +466,11 @@ class NetexImporter:
         stack: List[ET.Element] = []
         push, pop = stack.append, stack.pop
         get = None  # bound to the tag-qualified handler dict on the root event
+        # Start-event hooks, for the few handlers that need to know what they
+        # are *inside* (a Quay's StopPlace): by the time an element's end event
+        # fires its children have been pruned, so containment is recorded on
+        # the way in. Attributes are complete on a start event; children not.
+        start_get = None
         try:
             for event, elem in ET.iterparse(source, events=("start", "end")):
                 if event == "start":
@@ -455,8 +482,14 @@ class NetexImporter:
                         if elem.tag.startswith("{"):
                             uri = self._ns["n"]
                             get = {f"{{{uri}}}{k}": v for k, v in handlers.items()}.get
+                            start_get = {f"{{{uri}}}{k}": v
+                                         for k, v in (start_handlers or {}).items()}.get
                         else:
                             get = handlers.get
+                            start_get = (start_handlers or {}).get
+                    start = start_get(elem.tag)
+                    if start is not None:
+                        start(elem)
                     push(elem)
                     continue
                 pop()
@@ -495,7 +528,17 @@ class NetexImporter:
         if assessment is None:
             return None
         value = _text(assessment.find("n:MobilityImpairedAccess", self._ns))
-        return {"true": 1, "false": 2}.get(value)
+        # "unknown" is GTFS's 0, "no information": a statement, not an absence.
+        return {"unknown": 0, "true": 1, "false": 2}.get(value)
+
+    def _key_values(self, el: ET.Element) -> Dict[str, str]:
+        """All of an element's own keyList entries, as a dict."""
+        out = {}
+        for kv in el.findall("n:keyList/n:KeyValue", self._ns):
+            key = _text(kv.find("n:Key", self._ns))
+            if key:
+                out[key] = _text(kv.find("n:Value", self._ns))
+        return out
 
     def _key_value(self, el: ET.Element, key: str) -> Optional[str]:
         """Value of a keyList KeyValue entry with the given Key, or None."""
@@ -574,24 +617,116 @@ class NetexImporter:
             })
 
         def on_stop_place(sp: ET.Element) -> None:
+            if state.open_stop_places:
+                state.open_stop_places.pop()
             sid = sp.attrib.get("id")
             if not sid:
                 return
+            level = self._key_value(sp, "gtfs_level_id")
+            if level:
+                state.stop_place_level[sid] = level
             lat, lon = self._centroid_coords(sp, f"StopPlace {sid}")
             state.stop_places[sid] = (
                 _text(sp.find("n:Name", self._ns)), lat, lon, self._access_int(sp),
                 _text(sp.find("n:PrivateCode", self._ns)),
             )
 
+        def parent_stop_place() -> Optional[str]:
+            return state.open_stop_places[-1] if state.open_stop_places else None
+
+        def level_ref(el: ET.Element) -> Optional[str]:
+            ref = el.find("n:LevelRef", self._ns)
+            return ref.attrib.get("ref") if ref is not None else None
+
         def on_quay(q: ET.Element) -> None:
             qid = q.attrib.get("id")
             if not qid:
                 return
+            parent = parent_stop_place()
+            if parent:
+                state.site_children.add(parent)
+            state.quay_site[qid] = (parent, level_ref(q),
+                                    _text(q.find("n:PublicCode", self._ns)))
             lat, lon = self._centroid_coords(q, f"Quay {qid}")
             state.quays[qid] = (
                 _text(q.find("n:Name", self._ns)), lat, lon, self._access_int(q),
                 _text(q.find("n:PrivateCode", self._ns)),
             )
+
+        def on_site_component(location_type: int):
+            def handler(el: ET.Element) -> None:
+                cid = el.attrib.get("id")
+                if not cid:
+                    return
+                parent = parent_stop_place()
+                if parent:
+                    state.site_children.add(parent)
+                lat, lon = self._centroid_coords(el, f"{_localname(el.tag)} {cid}")
+                state.site_components[cid] = {
+                    "id": cid, "name": _text(el.find("n:Name", self._ns)),
+                    "lat": lat, "lon": lon, "location_type": location_type,
+                    "parent_id": parent, "level_ref": level_ref(el),
+                    "wheelchair_boarding": self._access_int(el),
+                }
+            return handler
+
+        def on_level(lv: ET.Element) -> None:
+            lid = lv.attrib.get("id")
+            if not lid:
+                return
+            keys = self._key_values(lv)
+            index = keys.get("gtfs_level_index")
+            if index is None:
+                index = _text(lv.find("n:RelativeLevelOrder", self._ns))
+            try:
+                index = float(index) if index is not None else 0.0
+            except ValueError:
+                index = 0.0
+            state.levels[lid] = (keys.get("gtfs_level_id") or lid,
+                                 _text(lv.find("n:Name", self._ns)), index)
+
+        def on_path_link(link: ET.Element) -> None:
+            lid = link.attrib.get("id")
+            ends = []
+            for tag in ("n:From", "n:To"):
+                ref = link.find(f"{tag}/n:PlaceRef", self._ns)
+                ends.append(ref.attrib.get("ref") if ref is not None else None)
+            if not (lid and ends[0] and ends[1]):
+                state.add_stat("skipped_pathway", 1)
+                return
+            keys = self._key_values(link)
+            mode = keys.get("gtfs_pathway_mode")
+            if mode is None:
+                mode = _ACCESS_FEATURE_PATHWAY.get(
+                    _text(link.find("n:AccessFeatureType", self._ns)), 1)
+            steps = _text(link.find("n:NumberOfSteps", self._ns))
+            if steps is not None:
+                steps = int(steps)
+                if _text(link.find("n:Transition", self._ns)) == "down":
+                    steps = -steps
+            duration = link.find("n:TransferDuration/n:DefaultDuration", self._ns)
+
+            def num(tag):
+                value = _text(link.find(tag, self._ns))
+                try:
+                    return float(value) if value is not None else None
+                except ValueError:
+                    return None
+
+            slope = keys.get("gtfs_max_slope")
+            state.path_links.append({
+                "id": lid, "from_ref": ends[0], "to_ref": ends[1],
+                "pathway_mode": int(mode),
+                "is_bidirectional": _text(link.find("n:AllowedUse", self._ns)) != "oneWay",
+                "length": num("n:Distance"),
+                "traversal_time": (_duration_secs(_text(duration))
+                                   if duration is not None else None),
+                "stair_count": steps,
+                "max_slope": float(slope) if slope is not None else None,
+                "min_width": num("n:MinimumWidth"),
+                "signposted_as": _text(link.find("n:Towards", self._ns)),
+                "reversed_signposted_as": _text(link.find("n:Back", self._ns)),
+            })
 
         def on_assignment(pa: ET.Element) -> None:
             ssp_ref = pa.find("n:ScheduledStopPointRef", self._ns)
@@ -930,6 +1065,11 @@ class NetexImporter:
             "Authority": on_operator,
             "StopPlace": on_stop_place,
             "Quay": on_quay,
+            "StopPlaceEntrance": on_site_component(2),
+            "AccessSpace": on_site_component(3),
+            "Level": on_level,
+            "SitePathLink": on_path_link,
+            "PathLink": on_path_link,
             "PassengerStopAssignment": on_assignment,
             "ScheduledStopPoint": on_ssp,
             "Line": on_line,
@@ -949,6 +1089,12 @@ class NetexImporter:
             "ServiceJourney": on_service_journey,
             "TemplateServiceJourney": on_service_journey,
         }
+
+    def _pass1_start_handlers(self, state: _RunState) -> Dict[str, callable]:
+        """Start-event hooks for pass 1: which StopPlace an element is inside."""
+        def on_stop_place_start(sp: ET.Element) -> None:
+            state.open_stop_places.append(sp.attrib.get("id"))
+        return {"StopPlace": on_stop_place_start}
 
     def _flush_reference_data(self, db: TransmodelDatabase, state: _RunState) -> None:
         # The document's locale reaches the rows here, after pass 1 has seen
@@ -982,6 +1128,7 @@ class NetexImporter:
                 )
                 self._report("scheduled_stop_point", state.stats["scheduled_stop_point"])
             logger.info("Imported %d stops", len(stops))
+        self._flush_station_structure(db, state)
 
         # Calendar: fold DayTypeAssignments (dates and operating periods) into
         # day-type validity + exceptions, and materialize Swiss-style
@@ -1244,8 +1391,86 @@ class NetexImporter:
                 )
                 self._report("point_in_journey_pattern", state.stats["point_in_journey_pattern"])
 
+    def _stations(self, state: _RunState) -> set:
+        """The StopPlaces that are stations (GTFS location_type 1).
+
+        A StopPlace that contains something -- a Quay, an entrance, an access
+        space -- and is not itself standing in for a ScheduledStopPoint. The
+        second condition is what keeps a one-stop StopPlace of our own export,
+        or of the Portuguese profile (which gives the two the same id), from
+        becoming a station of itself.
+        """
+        return {sid for sid in state.site_children
+                if sid in state.stop_places and sid not in state.ssp_points}
+
+    def _level_ids(self, state: _RunState) -> Dict[str, str]:
+        """NeTEx Level id -> GTFS level id. A level our exporter copied into
+        several stations names the GTFS level in its keyList; the copies fold
+        back into one."""
+        return {lid: gtfs_id for lid, (gtfs_id, _, _) in state.levels.items()}
+
+    def _flush_station_structure(self, db: TransmodelDatabase, state: _RunState) -> None:
+        """Levels, stations, entrances, access spaces and path links."""
+        level_ids = self._level_ids(state)
+        levels: Dict[str, dict] = {}
+        for gtfs_id, name, index in state.levels.values():
+            levels.setdefault(gtfs_id, {"id": gtfs_id, "index": index, "name": name})
+        if levels:
+            state.add_stat("level", db.upsert("level", list(levels.values()), validate=False))
+
+        stations = self._stations(state)
+        areas = []
+        order = {sid: i for i, sid in enumerate(state.stop_places)}
+        for sid in sorted(stations, key=order.__getitem__):
+            name, lat, lon, wheelchair, _code = state.stop_places[sid]
+            areas.append({
+                "id": sid, "name": name or "Unnamed", "lat": lat, "lon": lon,
+                "location_type": 1, "parent_id": None,
+                "level_id": state.stop_place_level.get(sid),
+                "wheelchair_boarding": wheelchair,
+            })
+        for comp in state.site_components.values():
+            areas.append({
+                "id": comp["id"], "name": comp["name"] or "Unnamed",
+                "lat": comp["lat"], "lon": comp["lon"],
+                "location_type": comp["location_type"],
+                "parent_id": comp["parent_id"] if comp["parent_id"] in stations else None,
+                "level_id": level_ids.get(comp["level_ref"]),
+                "wheelchair_boarding": comp["wheelchair_boarding"],
+            })
+        if areas:
+            state.add_stat("stop_area", db.upsert("stop_area", areas, validate=False))
+
+        # A PathLink end is a Quay (back to its platform), or an entrance,
+        # access space or station, which kept their own ids.
+        area_ids = {a["id"] for a in areas}
+        pathways = []
+        unresolved = 0
+        for link in state.path_links:
+            ends = []
+            for ref in (link.pop("from_ref"), link.pop("to_ref")):
+                if ref in state.quay_platform:
+                    ends.append(state.quay_platform[ref])
+                elif ref in area_ids or ref in state.stop_ids:
+                    ends.append(ref)
+                else:
+                    ends.append(None)
+            if None in ends:
+                unresolved += 1
+                continue
+            link["from_stop_id"], link["to_stop_id"] = ends
+            pathways.append(link)
+        state.path_links = []
+        if unresolved:
+            logger.warning("Skipped %d path links with an end that is not a stop", unresolved)
+            state.add_stat("skipped_pathway", unresolved)
+        if pathways:
+            state.add_stat("pathway", db.upsert("pathway", pathways, validate=False))
+
     def _resolve_stops(self, state: _RunState) -> List[dict]:
         stops = []
+        stations = self._stations(state)
+        level_ids = self._level_ids(state)
         if state.ssp_points:
             for sid, (ssp_name, quay_ref_attr, ssp_code) in state.ssp_points.items():
                 # Resolution priority: assignment -> Quay/StopPlace, then the
@@ -1257,6 +1482,7 @@ class NetexImporter:
                 # a Quay and puts the code on the StopPlace above it, so
                 # stopping at the first match read the Quay and lost the code.
                 site = None
+                site_ref = None
                 site_code = ssp_code
                 for ref in (state.assignments.get(sid), quay_ref_attr, sid):
                     if not ref:
@@ -1266,6 +1492,7 @@ class NetexImporter:
                         continue
                     if site is None:
                         site = candidate
+                        site_ref = ref
                     if site_code is None:
                         site_code = candidate[4]
                 name = ssp_name or (site[0] if site else None)
@@ -1274,11 +1501,24 @@ class NetexImporter:
                 ) if site else (None, None, None)
                 if lat is None or lon is None:
                     logger.warning("No coordinates resolved for ScheduledStopPoint %s", sid)
-                stops.append({
+                row = {
                     "id": sid, "name": name or "Unnamed", "lat": lat, "lon": lon,
                     "wheelchair_boarding": wheelchair,
                     "code": site_code,
-                })
+                }
+                # A platform inside a station: the Quay's StopPlace is the
+                # parent, its LevelRef the level, its PublicCode the platform.
+                quay = state.quay_site.get(site_ref) if site_ref else None
+                if quay is not None:
+                    parent, level, public_code = quay
+                    if parent in stations:
+                        row["stop_area_id"] = parent
+                    if level in level_ids:
+                        row["level_id"] = level_ids[level]
+                    if public_code:
+                        row["platform_code"] = public_code
+                    state.quay_platform.setdefault(site_ref, sid)
+                stops.append(row)
         else:
             # No ScheduledStopPoint elements: fall back to importing StopPlaces
             # directly (minimal feeds where patterns reference StopPlace ids).

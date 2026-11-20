@@ -66,6 +66,7 @@ class ScheduledStopPoint(BaseModel):
     wheelchair_boarding: Optional[int] = Field(None, description="0=no info, 1=yes, 2=no")
     code: Optional[str] = Field(None, description="Rider-facing stop code (GTFS stop_code)")
     platform_code: Optional[str] = Field(None, description="Platform designation (GTFS platform_code)")
+    level_id: Optional[str] = Field(None, description="Reference to Level.id (GTFS level_id)")
     zone_id: Optional[str] = Field(None, description="Fare zone; referenced by FareRule origin/destination")
     description: Optional[str] = Field(None, description="Free-text description (GTFS stop_desc)")
     extras: Optional[str] = Field(None, description="JSON object of unmapped source fields")
